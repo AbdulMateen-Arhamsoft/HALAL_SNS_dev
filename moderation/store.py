@@ -22,6 +22,8 @@ from moderation.domain import Decision, ModerationRequest
 from moderation.errors import ATTEMPTS_EXHAUSTED
 
 NOTIFY_CHANNEL = "moderation_job"
+LANE_FAST = "fast"  # every D1 job and every post without a video
+LANE_VIDEO = "video"  # D2: a post with a video
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,11 @@ def decided_body(job_id: uuid.UUID, request: ModerationRequest, decision: Decisi
             {"media_id": r.media_id, "error_code": r.error_code, "detail": r.detail}
             for r in decision.rejected_images
         ]
+    if decision.rejected_videos:
+        body["rejected_videos"] = [
+            {"media_id": r.media_id, "error_code": r.error_code, "detail": r.detail}
+            for r in decision.rejected_videos
+        ]
     return body
 
 
@@ -92,15 +99,16 @@ def failed_body(job_id: uuid.UUID, content_id: str, content_version: int, error_
 # id is the one we generated, sends the notification.
 CREATE_JOB_SQL = """
 WITH up AS (
-    INSERT INTO job (id, request_id, surface, content_id, content_version, status, payload)
-    VALUES (%(id)s, %(request_id)s, %(surface)s, %(content_id)s, %(content_version)s, 'queued', %(payload)s)
+    INSERT INTO job (id, request_id, surface, content_id, content_version, status, payload, lane)
+    VALUES (%(id)s, %(request_id)s, %(surface)s, %(content_id)s, %(content_version)s, 'queued', %(payload)s, %(lane)s)
     ON CONFLICT (surface, content_id, content_version) DO UPDATE SET updated_at = job.updated_at
     RETURNING id, status
 )
 SELECT up.id, up.status
-  FROM up LEFT JOIN LATERAL (SELECT pg_notify(%(channel)s, '') WHERE up.id = %(id)s) AS notify ON true
+  FROM up LEFT JOIN LATERAL (SELECT pg_notify(%(channel)s, %(lane)s) WHERE up.id = %(id)s) AS notify ON true
 """
 
+# The notification payload is the lane, so a video job wakes only the video loop.
 CLAIM_JOB_SQL = """
 UPDATE job
    SET status = 'running',
@@ -109,7 +117,7 @@ UPDATE job
        updated_at = now()
  WHERE id = (
        SELECT id FROM job
-        WHERE status = 'queued' AND next_attempt_at <= now()
+        WHERE status = 'queued' AND next_attempt_at <= now() AND lane = %(lane)s
         ORDER BY created_at
         FOR UPDATE SKIP LOCKED
         LIMIT 1)
@@ -209,6 +217,24 @@ UPDATE outbox
 RETURNING id, callback_url, body, attempts
 """
 
+INSERT_FRAME_SQL = """
+INSERT INTO video_frame (job_id, media_id, frame_no, time_ms, source, scores, flagged, evidence_path)
+VALUES (%(job_id)s, %(media_id)s, %(frame_no)s, %(time_ms)s, %(source)s, %(scores)s, %(flagged)s, %(evidence_path)s)
+"""
+
+# Evidence older than the retention window: the flagged frames whose file should now be deleted.
+EXPIRED_EVIDENCE_SQL = """
+SELECT evidence_path FROM video_frame
+ WHERE flagged AND evidence_path IS NOT NULL AND created_at < now() - make_interval(days => %(days)s)
+"""
+
+CLEAR_EVIDENCE_SQL = "UPDATE video_frame SET evidence_path = NULL WHERE evidence_path = ANY(%(paths)s)"
+
+COUNT_PENDING_VIDEOS_SQL = """
+SELECT count(*) AS n FROM job
+ WHERE lane = 'video' AND status IN ('queued', 'running') AND payload ->> 'author_id' = %(author_id)s
+"""
+
 MARK_OUTBOX_SENT_SQL = "UPDATE outbox SET status = 'sent' WHERE id = %(id)s"
 MARK_OUTBOX_DEAD_SQL = "UPDATE outbox SET status = 'dead' WHERE id = %(id)s"
 MARK_OUTBOX_RETRY_SQL = "UPDATE outbox SET next_attempt_at = now() + make_interval(secs => %(delay_s)s) WHERE id = %(id)s"
@@ -262,7 +288,8 @@ class Store:
         await self._fetch_one("SELECT 1", {})
 
     async def create_job(self, request: ModerationRequest) -> tuple[uuid.UUID, str]:
-        """Queue a job and wake the workers. The same surface + content id + version returns the existing job."""
+        """Queue a job and wake the workers. The same surface + content id + version returns the existing job.
+        A post with videos goes to the 'video' lane (D2); everything else to 'fast'."""
         params = {
             "id": uuid.uuid4(),
             "request_id": request.request_id,
@@ -270,14 +297,20 @@ class Store:
             "content_id": request.content_id,
             "content_version": request.content_version,
             "payload": Jsonb(request.model_dump(mode="json")),
+            "lane": LANE_VIDEO if request.videos else LANE_FAST,
             "channel": NOTIFY_CHANNEL,
         }
         [row] = await self._fetch_all(CREATE_JOB_SQL, params)
         return row["id"], row["status"]
 
-    async def claim_job(self) -> ClaimedJob | None:
-        """Lease the oldest due job. None when there is none."""
-        row = await self._fetch_one(CLAIM_JOB_SQL, {"lease_s": self._cfg.lease_s})
+    async def count_pending_videos(self, author_id: str) -> int:
+        """Video jobs of one author that are still waiting or running: the per-user limit (VIDEO_MAX_PENDING_PER_USER)."""
+        row = await self._fetch_one(COUNT_PENDING_VIDEOS_SQL, {"author_id": author_id})
+        return int(row["n"]) if row is not None else 0
+
+    async def claim_job(self, lane: str = LANE_FAST) -> ClaimedJob | None:
+        """Lease the oldest due job of `lane`. None when there is none."""
+        row = await self._fetch_one(CLAIM_JOB_SQL, {"lease_s": self._cfg.lease_s, "lane": lane})
         if row is None:
             return None
         return ClaimedJob(row["id"], row["attempts"], ModerationRequest.model_validate(row["payload"]))
@@ -298,26 +331,54 @@ class Store:
             }
             for item in decision.items
         ]
-        row = await self._fetch_one(
-            SAVE_DECISION_SQL,
-            {
-                "job_id": job.job_id,
-                "attempts": job.attempts,
-                "label": decision.label.value,
-                "category": decision.category,
-                "reason": decision.reason,
-                "items": Jsonb(items),
-                "policy_version": decision.policy_version,
-                "model_versions": Jsonb(decision.model_versions),
-                "image_model": decision.model_versions.get("image"),
-                "media_ids": list(decision.embeddings),
-                "vectors": [list(vector) for vector in decision.embeddings.values()],
-                "callback_url": _url(job.request),
-                "body": Jsonb(decided_body(job.job_id, job.request, decision)),
-                "lease_s": self._cfg.lease_s,
-            },
-        )
-        return None if row is None else SaveResult(_outbox_item(row), row["latency_ms"])
+        params = {
+            "job_id": job.job_id,
+            "attempts": job.attempts,
+            "label": decision.label.value,
+            "category": decision.category,
+            "reason": decision.reason,
+            "items": Jsonb(items),
+            "policy_version": decision.policy_version,
+            "model_versions": Jsonb(decision.model_versions),
+            "image_model": decision.model_versions.get("image"),
+            "media_ids": list(decision.embeddings),
+            "vectors": [list(vector) for vector in decision.embeddings.values()],
+            "callback_url": _url(job.request),
+            "body": Jsonb(decided_body(job.job_id, job.request, decision)),
+            "lease_s": self._cfg.lease_s,
+        }
+        # The decision and its video frames commit together, or not at all (D2).
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(SAVE_DECISION_SQL, params)
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            if decision.video_frames:
+                frame_rows = [
+                    {
+                        "job_id": job.job_id,
+                        "media_id": f.media_id,
+                        "frame_no": f.frame_no,
+                        "time_ms": f.time_ms,
+                        "source": f.source,
+                        "scores": Jsonb(f.scores),
+                        "flagged": f.flagged,
+                        "evidence_path": f.evidence_path,
+                    }
+                    for f in decision.video_frames
+                ]
+                async with conn.cursor() as frames_cur:
+                    await frames_cur.executemany(INSERT_FRAME_SQL, frame_rows)
+            return SaveResult(_outbox_item(row), row["latency_ms"])
+
+    async def expired_evidence(self, days: int) -> list[str]:
+        """Evidence files of flagged frames older than `days`. The worker deletes them, then clear_evidence."""
+        rows = await self._fetch_all(EXPIRED_EVIDENCE_SQL, {"days": days})
+        return [row["evidence_path"] for row in rows]
+
+    async def clear_evidence(self, paths: list[str]) -> None:
+        if paths:
+            await self._execute(CLEAR_EVIDENCE_SQL, {"paths": paths})
 
     async def fail_job(self, job: ClaimedJob, error_code: str) -> SaveResult | None:
         """Fail the job and reserve its moderation.failed callback to post now.
@@ -382,12 +443,12 @@ class Store:
         row = await self._fetch_one(GET_STATUS_SQL, {"job_id": job_id})
         return None if row is None else JobSnapshot(**row)
 
-    async def listen_for_jobs(self) -> AsyncIterator[None]:
-        """Yield once per new job, from a dedicated connection. Ends only on error."""
+    async def listen_for_jobs(self) -> AsyncIterator[str]:
+        """Yield the lane of each new job, from a dedicated connection. Ends only on error."""
         async with await AsyncConnection.connect(self._cfg.database_url, autocommit=True) as conn:
             await conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(NOTIFY_CHANNEL)))
-            async for _ in conn.notifies():
-                yield
+            async for notice in conn.notifies():
+                yield notice.payload or LANE_FAST
 
 
 def _url(request: ModerationRequest) -> str | None:

@@ -20,6 +20,7 @@ import signal
 import sys
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -30,9 +31,11 @@ from moderation.domain import CATEGORIES, UNCLASSIFIED, Decision
 from moderation.errors import INTERNAL_ERROR, PermanentError, RetryableError
 from moderation.fetch import ImageFetcher
 from moderation.logging_setup import configure_logging
-from moderation.moderate import Moderator
+from moderation.moderate import Moderator, VideoPipeline
 from moderation.policy import D1_POLICY, worst_item
-from moderation.store import ClaimedJob, OutboxItem, Store
+from moderation.store import LANE_FAST, LANE_VIDEO, ClaimedJob, OutboxItem, Store
+from moderation.video.check import VideoChecker
+from moderation.video.fetch import VideoFetcher
 
 if TYPE_CHECKING:
     from moderation.classifiers.image_siglip import SiglipImageClassifier
@@ -42,6 +45,7 @@ if TYPE_CHECKING:
 log = logging.getLogger("moderation.worker")
 
 ARCHIVE_SUBDIR = "by_category"  # under IMAGE_ALLOWED_ROOT: by_category/<label>/<category>/<file>
+EVIDENCE_SWEEP_S = 3600.0  # how often expired flagged-frame evidence is deleted
 
 
 def _category_folder_name(category: str | None) -> str:
@@ -89,20 +93,30 @@ class Worker:
         self._store = store
         self._moderator = moderator
         self._callbacks = callbacks
-        self._wake = asyncio.Event()
+        # One wake-up per lane: a video notification wakes only the video loop (D2).
+        self._wakes: dict[str, asyncio.Event] = {LANE_FAST: asyncio.Event(), LANE_VIDEO: asyncio.Event()}
         self._stop = asyncio.Event()
 
     def stop(self) -> None:
         self._stop.set()
-        self._wake.set()
+        for wake in self._wakes.values():
+            wake.set()
 
     async def run(self) -> None:
-        jobs = [asyncio.create_task(self._job_loop(), name=f"job-{i}") for i in range(self._cfg.fast_workers)]
+        jobs = [
+            asyncio.create_task(self._job_loop(LANE_FAST), name=f"job-fast-{i}") for i in range(self._cfg.fast_workers)
+        ]
+        jobs += [
+            asyncio.create_task(self._job_loop(LANE_VIDEO), name=f"job-video-{i}") for i in range(self._cfg.video_workers)
+        ]
         background = [
             asyncio.create_task(self.run_periodically(self._cfg.poll_s, step), name=step.__name__)
             for step in (self.listen_for_jobs, self._requeue_expired, self.send_due_callbacks, self._wake_jobs)
         ]
-        log.info("worker started", extra={"job_loops": len(jobs)})
+        background.append(
+            asyncio.create_task(self.run_periodically(EVIDENCE_SWEEP_S, self._sweep_evidence), name="_sweep_evidence")
+        )
+        log.info("worker started", extra={"job_loops": len(jobs), "video_loops": self._cfg.video_workers})
         await self._stop.wait()
         log.info("shutdown requested; finishing running jobs")
         for task in background:
@@ -111,15 +125,16 @@ class Worker:
 
     # --- jobs ---------------------------------------------------------------
 
-    async def _job_loop(self) -> None:
+    async def _job_loop(self, lane: str) -> None:
+        wake = self._wakes[lane]
         while not self._stop.is_set():
-            await self._wake.wait()
-            self._wake.clear()
+            await wake.wait()
+            wake.clear()
             try:
-                while not self._stop.is_set() and (job := await self._store.claim_job()) is not None:
+                while not self._stop.is_set() and (job := await self._store.claim_job(lane)) is not None:
                     await self.process(job)
             except Exception:
-                log.exception("job loop failed")
+                log.exception("job loop failed", extra={"lane": lane})
 
     async def process(self, job: ClaimedJob) -> None:
         """Check one job, save the decision, post the callback.
@@ -130,6 +145,7 @@ class Worker:
                 decision = await self._moderator.moderate(job.request)
             finally:
                 renew.cancel()
+            decision = await asyncio.to_thread(self._write_evidence, job, decision)
             saved = await self._store.save_decision(job, decision)
         except PermanentError as exc:
             await self._fail(job, exc.code)
@@ -147,6 +163,56 @@ class Worker:
         )
         if saved.callback is not None:
             await self.deliver_callback(saved.callback)
+
+    def _write_evidence(self, job: ClaimedJob, decision: Decision) -> Decision:
+        """Save each flagged video frame as a JPEG under VIDEO_EVIDENCE_ROOT/<job>/<media>/, and record its path.
+        Only flagged frames are written; everything else stays in memory and is dropped. A write failure raises,
+        so the job retries rather than being saved without its evidence."""
+        if not decision.video_frames:
+            return decision
+        root = Path(self._cfg.video_evidence_root).resolve()
+        records = []
+        for record in decision.video_frames:
+            if not record.flagged or not record.jpeg:
+                records.append(record)
+                continue
+            relative = Path(str(job.job_id)) / record.media_id / f"{record.frame_no:08d}_{record.time_ms}ms.jpg"
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(record.jpeg)
+            records.append(replace(record, jpeg=b"", evidence_path=relative.as_posix()))
+        return replace(decision, video_frames=tuple(records))
+
+    async def _sweep_evidence(self) -> None:
+        """Delete flagged-frame files older than VIDEO_RETENTION_DAYS, then clear their paths in the database."""
+        root = Path(self._cfg.video_evidence_root).resolve()
+        paths = await self._store.expired_evidence(self._cfg.video_retention_days)
+        removed: list[str] = []
+        for relative in paths:
+            target = (root / relative).resolve()
+            if not target.is_relative_to(root):
+                log.error("evidence path outside the evidence folder; not deleted", extra={"path_name": relative})
+                continue
+            try:
+                target.unlink(missing_ok=True)
+                removed.append(relative)
+            except OSError:
+                log.exception("could not delete evidence file", extra={"path_name": relative})
+        await self._store.clear_evidence(removed)
+        # Files with no database row (a worker that lost its lease after writing them) are not in the list above.
+        # They are removed by age on disk instead, so nothing private outlives the retention period.
+        cutoff = time.time() - self._cfg.video_retention_days * 86400
+        orphans = 0
+        if root.is_dir():
+            for path in root.rglob("*.jpg"):
+                try:
+                    if path.is_file() and path.stat().st_mtime < cutoff:
+                        path.unlink(missing_ok=True)
+                        orphans += 1
+                except OSError:
+                    log.exception("could not delete old evidence file", extra={"path_name": path.name})
+        if removed or orphans:
+            log.info("evidence swept", extra={"count": len(removed), "orphans": orphans})
 
     def _archive_uploaded_images(self, job: ClaimedJob, decision: Decision) -> None:
         """Keeps a copy of every raw-uploaded image (POST /v1/moderations/uploads), sorted by its own
@@ -250,11 +316,13 @@ class Worker:
     # --- wake-ups and housekeeping -----------------------------------------
 
     async def listen_for_jobs(self) -> None:
-        async for _ in self._store.listen_for_jobs():
-            self._wake.set()
+        async for lane in self._store.listen_for_jobs():
+            if lane in self._wakes:
+                self._wakes[lane].set()
 
     async def _wake_jobs(self) -> None:
-        self._wake.set()
+        for wake in self._wakes.values():
+            wake.set()
 
     async def _requeue_expired(self) -> None:
         if count := await self._store.requeue_expired_jobs(self._cfg.max_attempts):
@@ -376,7 +444,11 @@ async def serve(cfg: Settings) -> None:
         fetch_client = await stack.enter_async_context(
             httpx.AsyncClient(timeout=cfg.fetch_timeout_s, follow_redirects=False, trust_env=False)
         )
+        video_client = await stack.enter_async_context(
+            httpx.AsyncClient(timeout=cfg.video_fetch_timeout_s, follow_redirects=False, trust_env=False)
+        )
         callback_client = await stack.enter_async_context(httpx.AsyncClient(timeout=cfg.callback_timeout_s, trust_env=False))
+        # The moderator and the video checker share the same models: one copy of each in memory.
         moderator = Moderator(
             text=text,
             image=image,
@@ -385,6 +457,15 @@ async def serve(cfg: Settings) -> None:
             policy=D1_POLICY,
             model_versions=read_model_versions(cfg),
         )
+        checker = VideoChecker(
+            image=image,
+            ocr=ocr,
+            judge_texts=moderator.judge_texts,
+            policy=D1_POLICY,
+            hard_block=cfg.video_hard_block_codes,
+            text_unreadable_share=cfg.video_text_unreadable_share,
+        )
+        moderator.attach_video(VideoPipeline(cfg=cfg, fetcher=VideoFetcher(cfg, video_client), checker=checker))
         worker = Worker(cfg, store, moderator, callback_client)
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):

@@ -28,7 +28,6 @@ from typing import Any, Final
 
 from moderation.config import Settings
 from moderation.domain import CATEGORIES, ItemResult, ItemSource, Label, OcrResult
-from moderation.moderate import build_reason
 from moderation.policy import Policy, worst_item
 from moderation.text_clean import clean_text
 from moderation.video.frames import Frame
@@ -210,7 +209,7 @@ async def _run_clip(path: Path) -> dict[str, Any]:
     # Imported here: the API and the unit tests never load the model runtime.
     from moderation.config import get_settings
     from moderation.logging_setup import configure_logging
-    from moderation.moderate import Moderator
+    from moderation.moderate import Moderator, build_reason
     from moderation.policy import D1_POLICY
     from moderation.video.frames import select_frames
     from moderation.video.probe import probe

@@ -46,8 +46,9 @@ RUN mkdir moderation && touch moderation/__init__.py && pip install ".[models]" 
 COPY moderation ./moderation
 RUN pip install --no-deps .
 
+# /app/evidence: flagged video frames (D2), written by the worker only.
 RUN useradd --create-home --uid 10001 app \
-    && mkdir -p /app/uploads && chown app:app /app/uploads
+    && mkdir -p /app/uploads /app/evidence && chown app:app /app/uploads /app/evidence
 USER app
 
 # Model weights are mounted read-only at /app/models, never baked into the image.

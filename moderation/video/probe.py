@@ -23,8 +23,9 @@ from moderation.errors import (
     PermanentError,
 )
 
-# Container names PyAV reports for the formats we accept (MP4/MOV family, WebM/Matroska family).
-ACCEPTED_FORMATS: Final = frozenset({"mov", "mp4", "matroska", "webm"})
+# Container names PyAV reports for the formats we accept: MP4/MOV, WebM/Matroska, and the animated images
+# (GIF, APNG, animated WebP) that D2 checks frame by frame (decision 14).
+ACCEPTED_FORMATS: Final = frozenset({"mov", "mp4", "matroska", "webm", "gif", "apng", "webp_anim"})
 
 
 @dataclass(frozen=True)
@@ -85,7 +86,13 @@ def _duration_seconds(container: av.container.InputContainer, stream: av.video.s
         return float(stream.duration * stream.time_base)
     if container.duration is not None:
         return container.duration / av.time_base
-    return 0.0
+    # Animated WebP and APNG report no duration. Count the frames without decoding them (a demux pass, cheap).
+    rate = stream.average_rate
+    if rate is None or not rate:
+        return 0.0
+    frames = sum(1 for packet in container.demux(stream) if packet.size > 0)
+    container.seek(0)
+    return frames / float(rate)
 
 
 def _average_fps(stream: av.video.stream.VideoStream, container: av.container.InputContainer, duration_s: float) -> float:

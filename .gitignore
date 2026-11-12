@@ -1,4 +1,4 @@
-# Secrets and the Python environment
+﻿# Secrets and the Python environment
 .env
 .venv/
 
@@ -55,3 +55,8 @@ halal_sns_ai.egg-info/
 .gitattributes
 # Generated eval output (regenerate with tests/eval_text.py)
 local/eval_text_last.json
+
+# D2: flagged video frames (private evidence, kept VIDEO_RETENTION_DAYS)
+/evidence/
+
+/tmp-video/

@@ -63,9 +63,14 @@ def create_app(*, settings=None, store=None):
 
     @app.middleware("http")
     async def limit_body(request: Request, call_next):
-        # The upload endpoint carries raw image bytes, not JSON, so it gets its own (larger) cap.
-        is_upload = request.url.path == "/v1/moderations/uploads"
-        cap = cfg.image_max_bytes + 4096 if is_upload else cfg.api_max_body_bytes
+        # The upload endpoints carry raw image or video bytes, not JSON, so each gets its own (larger) cap.
+        path = request.url.path
+        if path == "/v1/moderations/uploads":
+            cap = cfg.image_max_bytes + 4096
+        elif path == "/v1/moderations/uploads/video":
+            cap = cfg.video_max_bytes + 4096
+        else:
+            cap = cfg.api_max_body_bytes
         declared = request.headers.get("content-length", "")
         if declared.isdigit() and int(declared) > cap:
             return JSONResponse(

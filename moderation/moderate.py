@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import replace
-from typing import Any
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
+from moderation.config import Settings
 from moderation.domain import (
     CATEGORIES,
     UNCLASSIFIED,
@@ -18,11 +20,16 @@ from moderation.domain import (
     ModerationRequest,
     OcrResult,
     RejectedImage,
+    RejectedVideo,
     TextScore,
+    VideoFrameRecord,
+    VideoRef,
 )
 from moderation.errors import (
     MEDIA_FORBIDDEN,
+    MEDIA_NOT_FOUND,
     MEDIA_TOO_LARGE,
+    MEDIA_TOO_LONG,
     MEDIA_UNDECODABLE,
     MEDIA_UNSUPPORTED,
     PermanentError,
@@ -30,8 +37,14 @@ from moderation.errors import (
 from moderation.fetch import is_animated
 from moderation.policy import Policy, worst_item
 from moderation.text_clean import Segment, clean_text, has_template_text, split_segments
+from moderation.video.fetch import VideoFetcher, write_temp_copy
+from moderation.video.frames import select_frames
+from moderation.video.probe import probe
 
-ANIMATED_REASON = "Animated image: not checked, held"
+if TYPE_CHECKING:
+    from moderation.video.check import VideoChecker
+
+ANIMATED_REASON = "Animated image: not checked, held"  # D1 behaviour, kept when no video pipeline is configured
 TEMPLATE_NOTE = "Text imitates the moderation prompt"
 
 # What the backend is told for an image we could not check (error_code -> detail).
@@ -41,6 +54,33 @@ REJECT_DETAILS = {
     MEDIA_UNDECODABLE: "file is unreadable or corrupt",
     MEDIA_FORBIDDEN: "image could not be accessed",
 }
+# What the backend is told for a video we could not check (D2).
+REJECT_VIDEO_DETAILS = {
+    MEDIA_TOO_LARGE: "video file or frame size is too large",
+    MEDIA_TOO_LONG: "video is longer than the allowed duration",
+    MEDIA_UNSUPPORTED: "unsupported video format: only MP4, MOV, WebM and MKV are accepted",
+    MEDIA_UNDECODABLE: "video file is unreadable or corrupt",
+    MEDIA_FORBIDDEN: "video could not be accessed",
+    MEDIA_NOT_FOUND: "video is not available yet",
+}
+
+
+@dataclass(frozen=True)
+class VideoPipeline:
+    """Everything a worker needs to check a video. None on a Moderator means videos are not checked (D1)."""
+
+    cfg: Settings
+    fetcher: VideoFetcher
+    checker: VideoChecker
+
+
+@dataclass
+class VideoSink:
+    """What the video checks produced for one request, collected next to the image results."""
+
+    items: list[ItemResult] = field(default_factory=list)
+    rejected: list[RejectedVideo] = field(default_factory=list)
+    frames: list[VideoFrameRecord] = field(default_factory=list)
 
 
 async def score_each[R](call: Callable[[list[bytes]], Awaitable[Sequence[R]]], blobs: list[bytes]) -> list[R | PermanentError]:
@@ -67,6 +107,7 @@ class Moderator:
         fetcher: Any,
         policy: Policy,
         model_versions: Mapping[str, str] | None = None,
+        video: VideoPipeline | None = None,
     ) -> None:
         self._text = text
         self._image = image
@@ -74,14 +115,25 @@ class Moderator:
         self._fetcher = fetcher
         self._policy = policy
         self._model_versions = dict(model_versions or {})
+        self._video = video
+
+    def attach_video(self, pipeline: VideoPipeline) -> None:
+        """Turn on video checks. The checker needs this moderator's text judge, so it is attached after both exist."""
+        self._video = pipeline
 
     async def moderate(self, request: ModerationRequest) -> Decision:
         """Fetch errors propagate unchanged: PermanentError fails the job, RetryableError retries it."""
-        # The text model runs in its own thread, so the caption is scored while the images are fetched and read.
-        caption, (images, embeddings, rejected) = await asyncio.gather(
-            self._judge_caption(request.text), self.moderate_images(request.images)
+        if request.videos and self._video is None:
+            # A worker without the video pipeline must not answer a post with videos: the job retries, then fails closed.
+            raise RuntimeError("video checks are not configured on this worker")
+        sink = VideoSink()
+        # The text model runs in its own thread, so the caption is scored while the images and videos are read.
+        caption, (images, embeddings, rejected), _ = await asyncio.gather(
+            self._judge_caption(request.text),
+            self.moderate_images(request.images, sink),
+            self.moderate_videos(request.videos, sink),
         )
-        items = [*caption, *images]
+        items = [*caption, *images, *sink.items]
         winner = worst_item(items)
         return Decision(
             label=winner.label,
@@ -92,7 +144,48 @@ class Moderator:
             embeddings=embeddings,
             model_versions=self._model_versions,
             rejected_images=tuple(rejected),
+            rejected_videos=tuple(sink.rejected),
+            video_frames=tuple(sink.frames),
         )
+
+    async def moderate_videos(self, videos: Sequence[VideoRef], sink: VideoSink) -> None:
+        """Each video: download (temporary copy, always deleted), probe, pick frames, check. A video that cannot
+        be checked is held and listed in rejected_videos; the other videos are still checked."""
+        for video in videos:
+            assert self._video is not None  # moderate() refuses videos without the pipeline
+            try:
+                async with self._video.fetcher.download(video.url) as path:
+                    await self._check_video_path(video.media_id, path, sink)
+            except PermanentError as exc:
+                self._reject_video(video.media_id, exc, sink)
+
+    async def _check_video_path(self, media_id: str, path: Path, sink: VideoSink) -> tuple[ItemResult, ...]:
+        """The frame pipeline on one local file. Raises PermanentError when the file cannot be checked."""
+        assert self._video is not None
+        cfg = self._video.cfg
+        info = await asyncio.to_thread(probe, path, cfg)
+        selection = await asyncio.to_thread(select_frames, path, cfg, info)
+        verdict = await self._video.checker.check(media_id, selection.frames)
+        sink.items.extend(verdict.items)
+        for frame, result in zip(selection.frames, verdict.frames, strict=True):
+            sink.frames.append(
+                VideoFrameRecord(
+                    media_id=media_id,
+                    frame_no=frame.frame_no,
+                    time_ms=frame.time_ms,
+                    source=frame.source,
+                    scores=result.scores,
+                    flagged=result.flagged,
+                    jpeg=frame.jpeg if result.flagged else b"",  # kept only as evidence for a flagged frame
+                )
+            )
+        return verdict.items
+
+    @staticmethod
+    def _reject_video(media_id: str, exc: PermanentError, sink: VideoSink) -> None:
+        detail = REJECT_VIDEO_DETAILS.get(exc.code, "video could not be checked")
+        sink.rejected.append(RejectedVideo(media_id, exc.code, detail))
+        sink.items.append(ItemResult(ItemSource.VIDEO, media_id, Label.HOLD, None, None, f"Video {media_id}: {detail}"))
 
     async def _judge_caption(self, text: str | None) -> list[ItemResult]:
         if not text:
@@ -104,21 +197,27 @@ class Moderator:
         return items
 
     async def moderate_images(
-        self, images: Sequence[ImageRef]
+        self, images: Sequence[ImageRef], sink: VideoSink | None = None
     ) -> tuple[list[ItemResult], dict[str, tuple[float, ...]], list[RejectedImage]]:
-        """An image we cannot check is held and reported in `rejected`; the other images are still checked."""
+        """An image we cannot check is held and reported in `rejected`; the other images are still checked.
+        An animated image (GIF, animated WebP or APNG) is checked frame by frame, as a video (D2)."""
+        sink = sink if sink is not None else VideoSink()
         fetched = await asyncio.gather(*(self._fetch(image) for image in images))
         embeddings: dict[str, tuple[float, ...]] = {}
         rejected: list[RejectedImage] = []
         by_position: dict[int, ItemResult] = {}
         usable: list[tuple[int, ImageRef, bytes]] = []
+        animated: list[tuple[int, ImageRef, bytes]] = []
         for position, (image, blob) in enumerate(zip(images, fetched, strict=True)):
             if isinstance(blob, PermanentError):
                 by_position[position] = self._reject(image.media_id, blob.code, rejected)
             elif is_animated(blob):
-                by_position[position] = ItemResult(
-                    ItemSource.IMAGE, image.media_id, Label.HOLD, None, None, ANIMATED_REASON
-                )
+                if self._video is None:
+                    by_position[position] = ItemResult(
+                        ItemSource.IMAGE, image.media_id, Label.HOLD, None, None, ANIMATED_REASON
+                    )
+                else:
+                    animated.append((position, image, blob))
             else:
                 usable.append((position, image, blob))
         data = [blob for _, _, blob in usable]
@@ -134,9 +233,25 @@ class Moderator:
             good_ocr.append(ocr)
             embeddings[image.media_id] = score.embedding
             by_position[position] = self._policy.judge_image(image.media_id, score.categories)
+        for position, image, blob in animated:
+            by_position[position] = await self._check_animated(image.media_id, blob, sink, rejected)
         items = [by_position[position] for position in range(len(images))]
         items.extend(await self._check_image_text(ids, good_ocr))
         return items, embeddings, rejected
+
+    async def _check_animated(
+        self, media_id: str, blob: bytes, sink: VideoSink, rejected: list[RejectedImage]
+    ) -> ItemResult:
+        """Run an animated image through the frame pipeline. Its own temporary copy is deleted in `finally`."""
+        assert self._video is not None
+        path = await asyncio.to_thread(write_temp_copy, blob, self._video.cfg)
+        try:
+            verdict_items = await self._check_video_path(media_id, path, sink)
+        except PermanentError as exc:
+            return self._reject(media_id, exc.code, rejected)
+        finally:
+            path.unlink(missing_ok=True)
+        return worst_item(list(verdict_items))
 
     async def _fetch(self, image: ImageRef) -> bytes | PermanentError:
         """A permanent fetch problem is about this image only. A retryable one still retries the whole job."""

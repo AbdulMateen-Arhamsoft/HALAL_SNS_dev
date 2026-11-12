@@ -1,4 +1,4 @@
-"""Image download.
+﻿"""Image download.
 
 Production: http(s) URLs from allowlisted hosts. Tests and local runs: a path under
 IMAGE_ALLOWED_ROOT. Both return the raw bytes after a size cap and a file-type check.
@@ -65,7 +65,23 @@ def _check_type(data: bytes) -> bytes:
     raise PermanentError(MEDIA_UNSUPPORTED, "not a JPEG, PNG, WebP or GIF image")
 
 
-def _check_status(status: int) -> None:
+def check_url(url: str, hosts: frozenset[str], allow_http_localhost: bool) -> None:
+    """The allowlist rule for every download (images and, from D2, videos): https on an allowed host, no credentials."""
+    with translate(PermanentError, MEDIA_FORBIDDEN, ValueError):
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()  # a malformed netloc raises ValueError here
+    if parts.username is not None or parts.password is not None:
+        raise PermanentError(MEDIA_FORBIDDEN, "credentials in URL are not allowed")
+    if host not in hosts:
+        raise PermanentError(MEDIA_FORBIDDEN, f"host {host!r} is not allowlisted")
+    if parts.scheme == "https":
+        return
+    if parts.scheme == "http" and allow_http_localhost and host in _LOCALHOST:
+        return
+    raise PermanentError(MEDIA_FORBIDDEN, f"scheme {parts.scheme!r} is not allowed for this host")
+
+
+def check_status(status: int) -> None:
     if 200 <= status < 300:
         return
     if 300 <= status < 400 or status in (401, 403):
@@ -97,7 +113,7 @@ class ImageFetcher:
         body = bytearray()
         with translate(RetryableError, MEDIA_NOT_FOUND, httpx.TransportError, TimeoutError):
             async with asyncio.timeout(self._timeout_s), self._client.stream("GET", url) as response:
-                _check_status(response.status_code)
+                check_status(response.status_code)
                 declared = response.headers.get("content-length")
                 if declared is not None and declared.isdigit() and int(declared) > self._max_bytes:
                     raise PermanentError(MEDIA_TOO_LARGE, f"declared {declared} bytes exceeds {self._max_bytes}")
@@ -108,18 +124,7 @@ class ImageFetcher:
         return bytes(body)
 
     def _check_url(self, url: str) -> None:
-        with translate(PermanentError, MEDIA_FORBIDDEN, ValueError):
-            parts = urlsplit(url)
-            host = (parts.hostname or "").lower()  # a malformed netloc raises ValueError here
-        if parts.username is not None or parts.password is not None:
-            raise PermanentError(MEDIA_FORBIDDEN, "credentials in URL are not allowed")
-        if host not in self._hosts:
-            raise PermanentError(MEDIA_FORBIDDEN, f"host {host!r} is not allowlisted")
-        if parts.scheme == "https":
-            return
-        if parts.scheme == "http" and self._allow_http_localhost and host in _LOCALHOST:
-            return
-        raise PermanentError(MEDIA_FORBIDDEN, f"scheme {parts.scheme!r} is not allowed for this host")
+        check_url(url, self._hosts, self._allow_http_localhost)
 
     def _read_local(self, url: str) -> bytes:
         """`url` is a path relative to IMAGE_ALLOWED_ROOT, or an absolute path inside it."""

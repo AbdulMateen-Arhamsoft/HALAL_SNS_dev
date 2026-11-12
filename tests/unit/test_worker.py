@@ -62,8 +62,9 @@ class FakeStore:
         self.next_outbox += 1
         return item
 
-    async def claim_job(self) -> ClaimedJob | None:
-        return self.queued.pop(0) if self.queued else None
+    async def claim_job(self, lane: str = "fast") -> ClaimedJob | None:
+        # D2: the fast loop claims only fast jobs; the D1 jobs here are all fast.
+        return self.queued.pop(0) if self.queued and lane == "fast" else None
 
     async def save_decision(self, job: ClaimedJob, decision: Decision) -> SaveResult | None:
         self.calls.append(("save", decision.label))
@@ -101,12 +102,18 @@ class FakeStore:
     async def claim_outbox(self, limit: int) -> list[OutboxItem]:
         return []
 
-    async def listen_for_jobs(self) -> AsyncIterator[None]:
+    async def expired_evidence(self, days: int) -> list[str]:
+        return []  # D2 evidence sweep: nothing has expired in these tests
+
+    async def clear_evidence(self, paths: list[str]) -> None:
+        return None
+
+    async def listen_for_jobs(self) -> AsyncIterator[str]:
         self.listens += 1
         if self.drop_first_listen and self.listens == 1:
             raise psycopg.OperationalError("server closed the connection unexpectedly")
         for _ in range(self.notify_on_connect):
-            yield
+            yield "fast"  # the lane of the announced job
         await asyncio.Event().wait()  # then a quiet connection: no more notifications
 
 

@@ -1,4 +1,4 @@
-# CPU stack: Postgres, database setup, API and worker.
+﻿# CPU stack: Postgres, database setup, API and worker.
 # Start: docker compose -f docker-compose.cpu.yml up -d --build
 
 name: halal-sns-ai
@@ -27,6 +27,8 @@ x-worker: &worker
     # can read them back. Only used if IMAGE_ALLOWED_ROOT=/app/uploads is set in .env. A project
     # folder (not a named volume) so the files are visible directly on the host, in ./uploads.
     - ./uploads:/app/uploads
+    # D2: flagged video frames (JPEG evidence), kept VIDEO_RETENTION_DAYS. Private: never commit this folder.
+    - ./evidence:/app/evidence
   command:
     - python
     - -m
@@ -38,6 +40,7 @@ x-worker-env: &worker-env
   <<: *app-env
   HF_HUB_OFFLINE: "1"
   TRANSFORMERS_OFFLINE: "1"
+  VIDEO_EVIDENCE_ROOT: /app/evidence
 
 services:
   postgres:
@@ -77,6 +80,8 @@ services:
       - ON_ERROR_STOP=1
       - -f
       - /migrations/001_init.sql
+      - -f
+      - /migrations/002_video.sql
     restart: "no"
 
   api:

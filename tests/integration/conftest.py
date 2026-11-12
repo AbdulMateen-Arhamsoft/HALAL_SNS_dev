@@ -28,7 +28,10 @@ if sys.platform == "win32":
     # psycopg async cannot run on the Proactor loop that Windows defaults to.
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-MIGRATION = Path(__file__).resolve().parents[2] / "migrations" / "001_init.sql"
+MIGRATIONS = [
+    Path(__file__).resolve().parents[2] / "migrations" / "001_init.sql",
+    Path(__file__).resolve().parents[2] / "migrations" / "002_video.sql",  # D2: job.lane and video_frame
+]
 
 
 @pytest.fixture
@@ -45,7 +48,8 @@ def db_url() -> str:
 @pytest.fixture
 async def store(db_url: str) -> AsyncIterator[Store]:
     async with await psycopg.AsyncConnection.connect(db_url, autocommit=True) as conn:
-        await conn.execute(MIGRATION.read_text(encoding="utf-8"))
+        for migration in MIGRATIONS:  # both are idempotent, so re-running them on an existing test database is safe
+            await conn.execute(migration.read_text(encoding="utf-8"))
         await conn.execute("TRUNCATE job, decision, outbox, image_embedding RESTART IDENTITY CASCADE")
     job_store = Store(Settings(database_url=db_url, lease_s=60))
     await job_store.open()

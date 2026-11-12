@@ -23,6 +23,7 @@ from moderation.errors import PermanentError
 from moderation.fetch import _check_type, guess_extension
 from moderation.policy import Policy
 from moderation.store import Store
+from moderation.video.fetch import video_extension
 
 
 # What a route needs comes from app.state, which create_app fills.
@@ -61,6 +62,7 @@ ERRORS = {
     401: {"model": ErrorResponse, "description": "unauthorized: missing or invalid X-API-Key"},
     404: {"model": ErrorResponse, "description": "not_found: no job with this id"},
     422: {"model": ErrorResponse, "description": "limit_exceeded, or a malformed body (FastAPI's own 'detail' list)"},
+    429: {"model": ErrorResponse, "description": "rate_limited: this author has too many videos waiting; try again later"},
     503: {"model": ErrorResponse, "description": "unavailable: the database is down, retry"},
 }
 
@@ -98,7 +100,15 @@ async def submit_moderation(
     if not policy.accepts(body.surface):
         raise Rejected(400, "unknown_surface", body.surface)
     check_limits(body, cfg)
+    if body.videos:
+        await check_video_quota(store, body, cfg)
     job_id, status = await store.create_job(body)
+    if body.videos:
+        # D2: a post with a video is answered at once. The result comes by callback or GET /v1/moderations/{job_id}.
+        row = await store.get_job_status(job_id)
+        if row is not None and row.status in FINISHED:
+            return JSONResponse(status_code=200, content=job_response(row).model_dump())
+        return JSONResponse(status_code=202, content=AcceptedResponse(job_id=str(job_id), status=status).model_dump())
     row = await wait_for_decision(store, cfg, job_id)
     if row is not None:
         return JSONResponse(status_code=200, content=job_response(row).model_dump())
@@ -141,6 +151,41 @@ async def upload_image(
     return UploadResponse(media_id=media_id, url=f"uploads/{filename}")
 
 
+@moderations.post(
+    "/uploads/video",
+    status_code=201,
+    summary="Upload a raw video instead of hosting it yourself (D2)",
+    responses={
+        401: ERRORS[401],
+        422: ERRORS[422],
+        503: {"model": ErrorResponse, "description": "unavailable: raw uploads are disabled on this deployment"},
+    },
+)
+async def upload_video(
+    cfg: CfgDep,
+    file: Annotated[UploadFile, File(description="The raw video bytes")],
+) -> UploadResponse:
+    """Stores the file and returns a `url` to put in `videos[].url` on the next `POST /v1/moderations`. Disabled unless
+    the deployment sets `IMAGE_ALLOWED_ROOT`. Accepts MP4, MOV, WebM and MKV, judged by file content, up to
+    `VIDEO_MAX_BYTES`. Duration, size and frame limits are checked by the worker, which holds a video that fails them.
+    """
+    root = cfg.image_allowed_root.strip()
+    if not root:
+        raise Rejected(503, "unavailable", "raw uploads are disabled on this deployment")
+    data = await file.read(cfg.video_max_bytes + 1)
+    if len(data) > cfg.video_max_bytes:
+        raise Rejected(422, "limit_exceeded", f"video larger than {cfg.video_max_bytes} bytes")
+    extension = video_extension(data)
+    if extension is None:
+        raise Rejected(422, "limit_exceeded", "not an MP4, MOV, WebM or MKV video")
+    uploads_dir = Path(root) / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    media_id = secrets.token_hex(8)
+    filename = media_id + extension
+    (uploads_dir / filename).write_bytes(data)
+    return UploadResponse(media_id=media_id, url=f"uploads/{filename}")
+
+
 @moderations.get(
     "/{job_id}",
     response_model=JobStatusResponse,
@@ -164,6 +209,15 @@ async def healthz():
 async def readyz(store: StoreDep):
     await store.ping()
     return {"status": "ready"}
+
+
+async def check_video_quota(store, body, cfg) -> None:
+    """The per-user limit (D2): an author may have VIDEO_MAX_PENDING_PER_USER video posts waiting or running."""
+    if len(body.videos) > cfg.api_max_videos:
+        raise Rejected(422, "limit_exceeded", f"too many videos: {len(body.videos)} > {cfg.api_max_videos}")
+    pending = await store.count_pending_videos(body.author_id)
+    if pending >= cfg.video_max_pending_per_user:
+        raise Rejected(429, "rate_limited", f"{pending} videos are already waiting for this author; try again later")
 
 
 def check_limits(body, cfg):
