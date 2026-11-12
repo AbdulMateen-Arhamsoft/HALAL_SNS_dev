@@ -1,8 +1,8 @@
 # Halal SNS Moderation Checker
 
-Automatic content moderation for the Halal SNS platform. The backend sends a post (a caption and image URLs). The checker checks the post and answers the same request, normally within a second or two, with whether to **allow**, **hold** or **block** it, a category and a one-line reason. If a check is slower than 10 s, the answer is `202` and the decision is read later.
+Automatic content moderation for the Halal SNS platform. The backend sends a post (a caption, image URLs and, for posts with a video, a video URL). The checker checks the post and answers the same request, normally within a second or two, with whether to **allow**, **hold** or **block** it, a category and a one-line reason. If a check is slower than 10 s, the answer is `202` and the decision is read later.
 
-**Status:** D1 (general moderation on upload) is implemented and tested. See [Project status](#project-status).
+**Status:** D1 (images and text) and D2 (video, stories and reels) are implemented and tested. D2 has not yet been deployed to the shared stack. See [Project status](#project-status).
 
 ## Contents
 
@@ -32,7 +32,7 @@ sequenceDiagram
     B->>A: POST /v1/moderations (caption, image URLs)
     A->>D: save job, wake worker
     W->>D: claim job
-    W->>W: check caption, images, text in images
+    W->>W: check caption, images, video frames, text in images and videos
     W->>D: save decision
     A->>D: check the job every 0.1 s (up to 10 s)
     A-->>B: 200 {status, label, category, reason}
@@ -46,8 +46,11 @@ sequenceDiagram
 | Caption, and text found inside images | Qwen3Guard-Gen-0.6B | GPU or CPU |
 | Each image | SigLIP2 (base, 384) plus a zero-shot head | GPU or CPU |
 | Text inside images | RapidOCR (PP-OCRv5, ONNX) | CPU |
+| Video frames (D2): about one per second, plus each scene change | SigLIP 2 (same as images) | GPU or CPU |
+| Text on video frames (D2) | RapidOCR, then Qwen3Guard (same as captions) | CPU, then GPU or CPU |
 
-- The worst result across the caption and all images decides the post: `block` > `hold` > `allow`.
+- The worst result across the caption, all images and all videos decides the post: `block` > `hold` > `allow`.
+- A video (D2) is sampled to at most 240 frames (one per second, plus every scene change, minus near-copies). The frames are scored like images. For the hard-block categories (`G-01`, `G-03`, `G-05` by default) one flagged frame is enough; for the others the mean of the three worst frames is used. Flagged frames are saved as private evidence for `VIDEO_RETENTION_DAYS`.
 - Categories are G-01 to G-07: violence, weapons, sexual content, hate and harassment, self-harm, drugs and illegal goods, crime and fraud.
 - An image that cannot be checked (too large, wrong type, unreadable, blocked host) is held and listed in the callback as `rejected_images`. The `200` and `GET` answers only say `hold` with a reason. The other images are still checked.
 - Jobs, decisions and callbacks live in Postgres. A crash delays a post but never loses it or publishes it unchecked. A job's lease is renewed while it runs, and a crashed worker's job is picked up again.
@@ -63,6 +66,8 @@ sequenceDiagram
 7. One database statement saves the decision and marks the job done.
 8. The API answers `200` with the decision (or with the failure), or `202 {job_id, status}` if the check is slower than the wait. After a `202` the backend polls `GET /v1/moderations/{job_id}` or waits for the callback. If `callback_url` was sent, the callback is also POSTed (optional, 5 s limit), and retried after 1, 5, 30, 120 and 600 s, up to 10 tries.
 
+**Videos (D2).** A post with a `videos` entry goes to the `video` lane, which has its own worker loop (`VIDEO_WORKERS` = 1). The API answers `202` at once, and the decision comes by callback or `GET`. The worker downloads the video (a temporary copy, always deleted), checks its length, size, resolution and format, picks the frames, and checks them. A video that cannot be checked is held and listed in `rejected_videos`; it is never allowed. Animated images (GIF, animated WebP, APNG) take the same path.
+
 **When something goes wrong.** A temporary problem retries the job after 5, 15, 60 and 300 s, then fails it with an `error_code`. A permanent problem answers `200` with `status: failed` (and sends a `moderation.failed` callback if one was asked for). A worker crash requeues the job after the lease ends. If the database is down, the API answers `503` within 5 s.
 
 ## Repository layout
@@ -76,13 +81,14 @@ moderation/            the service: the only code that ships in the Docker image
   text_clean.py          caption cleaning and the paragraphs, sentences and clauses scored on their own
   fetch.py               image download: allowed hosts, size, file type
   store.py               Postgres access: jobs, decisions, callbacks to send
+  video/                 D2: fetch.py (download, temporary copy), probe.py (PyAV checks), frames.py (frame selection), check.py (verdict; command line)
   prompts.py             every prompt: the image categories (SigLIP2) and the Qwen3Guard detail text
   domain.py              shared types: labels, categories, the request
   errors.py              the two error kinds
   logging_setup.py       JSON logs; caption and OCR text never reach them
   config.py              every setting, and the pinned model versions
   classifiers/           text (Qwen3Guard), image (SigLIP2), OCR (RapidOCR)
-migrations/            database schema (001_init.sql)
+migrations/            database schema (001_init.sql, 002_video.sql)
 tests/                 unit/ (no GPU, no database), integration/ (Postgres), models/ (real weights);
                        eval_text.py: runs the labelled captions in tests/data through the real text pipeline
 testui/                local test page for the Check door
@@ -272,6 +278,7 @@ All settings are environment variables, read from `.env`. [.env.example](.env.ex
 | `API_WAIT_S` / `API_WAIT_POLL_S` | 10 s / 0.1 s | How long `POST /v1/moderations` waits for the decision before answering `202` (`0`: never wait), and how often it checks the job. |
 | `CALLBACK_TIMEOUT_S` / `CALLBACK_MAX_ATTEMPTS` | 5 s / 10 | Callback delivery. |
 | `API_KEYS` | empty (auth disabled) | `name:key` pairs, comma-separated. Required whenever the API is reachable from outside this machine (see [Team testing over ngrok](#team-testing-over-ngrok)). |
+| `VIDEO_*`, `API_MAX_VIDEOS` | see below | Video (D2) limits: length, frames per second, frame cap, scene and duplicate limits, file size, temporary and evidence folders, retention, hard-block categories. Every key and its note is in [.env.example](.env.example). |
 
 Model versions are pinned in `moderation/config.py` (`MODEL_PINS`).
 
@@ -293,12 +300,13 @@ Every URL is `{BASE_URL}` plus a path. `{BASE_URL}` is the address where the che
 | `POST {BASE_URL}/v1/moderations` | Send a post and wait for the decision. | `200` decision, or `202 {job_id, status}` if the check takes longer than `API_WAIT_S` |
 | `GET {BASE_URL}/v1/moderations/{job_id}` | State of one job. `{job_id}` is the UUID from a `202` (or a `200`). | `200` same body as the `POST` decision |
 | `POST {BASE_URL}/v1/moderations/uploads` | Upload one raw image instead of hosting it. Needs `IMAGE_ALLOWED_ROOT` (see [Raw image uploads](#raw-image-uploads)). | `201 {media_id, url}` |
+| `POST {BASE_URL}/v1/moderations/uploads/video` | Upload one raw video (MP4, MOV, WebM or MKV) instead of hosting it. Needs `IMAGE_ALLOWED_ROOT`. | `201 {media_id, url}` |
 | `GET {BASE_URL}/healthz` | The process is up. | `200 {"status": "ok"}` |
 | `GET {BASE_URL}/readyz` | The database answers. | `200 {"status": "ready"}`, or `503` |
 
 - Only these paths exist. There is no `/api` prefix and no trailing slash: `/v1/moderations`, not `/v1/moderations/`.
 - Send and receive JSON. On `POST` set the header `Content-Type: application/json`. If `API_KEYS` is set (required whenever the checker is reachable from outside this machine, for example over the ngrok tunnel), also send `X-API-Key: <your key>`; a missing or wrong key is `401 unauthorized`. `/healthz` and `/readyz` never need a key.
-- The `POST` can wait up to `API_WAIT_S` (10 s) for the answer, so set the backend's HTTP timeout above that, for example 15 s.
+- The `POST` can wait up to `API_WAIT_S` (10 s) for the answer, so set the backend's HTTP timeout above that, for example 15 s. A post with a `videos` entry is not waited for: it is answered `202` at once (or `200` if that content version is already decided). Read the result with `GET` or the callback.
 
 **Send a post: `POST {BASE_URL}/v1/moderations`**
 
@@ -307,17 +315,20 @@ Body fields. A field that is not listed is refused (`422`), so do not send extra
 | Field | Type | Required | Meaning |
 |---|---|---|---|
 | `request_id` | string, 1 to 128 characters | yes | Your id for this call. Used for tracing only. A new value per call is fine. |
-| `surface` | string, up to 32 characters | yes | What is checked. Only `"post"` is accepted today; anything else is `400 unknown_surface`. |
+| `surface` | string, up to 32 characters | yes | What is checked: `"post"`, `"story"` or `"reel"`. Anything else is `400 unknown_surface`. |
 | `content_id` | string, 1 to 128 characters | yes | Your id for the post. |
 | `content_version` | integer, 1 or more | yes | Starts at 1. An edit of the same post sends a higher number and is checked again. |
-| `author_id` | string, up to 128 characters | no | Id of the author. Stored for tracing. |
+| `author_id` | string, up to 128 characters | no | Id of the author. Stored for tracing, and used for the per-user video limit when sent. |
 | `text` | string, up to 10,000 characters | one of `text` or `images` | The caption. |
 | `images` | list of up to 10 objects | one of `text` or `images` | The images to check. Each object has `media_id` and `url` (next rows). |
 | `images[].media_id` | string, 1 to 128 characters | yes, per image | Your id for the image. Must be unique within the request. Comes back in `rejected_images` and in the reason. |
 | `images[].url` | string, up to 2,048 characters | yes, per image | Where the checker downloads the image. `https`, on a host in `IMAGE_ALLOWED_HOSTS`. |
+| `videos` | list of up to `API_MAX_VIDEOS` (1) objects | one of `text`, `images` or `videos` | The videos to check (D2). Each object has `media_id` and `url`, like an image. A post with a video is answered `202` at once. |
+| `videos[].media_id` | string, 1 to 128 characters | yes, per video | Your id for the video. Must be unique within the request, across images and videos. |
+| `videos[].url` | string, 1 to 2,048 characters | yes, per video | Where the checker downloads the video: `https` on a host in `IMAGE_ALLOWED_HOSTS`, or the `url` returned by `POST /v1/moderations/uploads/video`. |
 | `callback_url` | URL, up to 500 characters | no | Where the checker POSTs the decision. Leave it out to poll with `GET` instead. See "Receive the callback" below. |
 
-At least one of `text` or `images` must be present, and `media_id` values must be unique. `callback_url` must be a full `http` or `https` URL that the **worker** can reach: from inside Docker, `localhost` is the worker container itself, so use a real host name (on Docker Desktop, `host.docker.internal` reaches your machine).
+At least one of `text`, `images` or `videos` must be present, and `media_id` values must be unique across images and videos. `callback_url` must be a full `http` or `https` URL that the **worker** can reach: from inside Docker, `localhost` is the worker container itself, so use a real host name (on Docker Desktop, `host.docker.internal` reaches your machine).
 
 Example body:
 
@@ -397,7 +408,7 @@ If `callback_url` was sent, the worker also POSTs the result there, as well as t
 - may get the same callback more than once, so match on `job_id` (or `content_id` + `content_version`) and ignore repeats.
 - is reachable from the worker. The callback is not signed and carries no secret, so keep it on a private network or check the `job_id` against jobs you submitted.
 
-It is the only place that lists `rejected_images`:
+It is the only place that lists `rejected_images` and `rejected_videos` (a video that could not be checked, with its `error_code`):
 
 ```json
 {
@@ -442,6 +453,7 @@ After a decision, the worker also keeps a copy of every uploaded image in `uploa
 |---|---|---|---|
 | 400 | `unknown_surface` | `surface` is not `"post"` | Fix the request. |
 | 404 | `not_found` | `GET` with a `job_id` that does not exist | Check the id. |
+| 429 | `rate_limited` | A post with a video, from an author who already has `VIDEO_MAX_PENDING_PER_USER` videos waiting or running. Only applies when the post has an `author_id`. | Wait, then send the post again. |
 | 413 | `body_too_large` | Body larger than 128 KiB (an upload: larger than `IMAGE_MAX_BYTES` plus a small margin) | Send less. |
 | 422 | `limit_exceeded` | Too many images, or text, image URL or callback URL too long. On an upload: the file is too big or not a JPEG, PNG, WebP or GIF | Stay within the limits below. |
 | 422 | (none: a `detail` list) | Malformed body: wrong type, missing field, unknown field, no text or images, duplicate `media_id` | Fix the body. The list says which field. |
@@ -466,12 +478,12 @@ Errors the API makes itself have the shape `{"error": "...", "detail": "..."}`. 
 **Rules**
 
 - Set the backend's HTTP timeout above `API_WAIT_S`, for example 15 s. Do not retry a timed-out call with a new `content_version`: send the same one again.
-- Only `surface: "post"` is accepted today. Anything else returns `400 unknown_surface`.
+- Accepted surfaces are `post`, `story` and `reel`. Anything else returns `400 unknown_surface`.
 - The same `surface` + `content_id` + `content_version` returns the same job. If it is already decided, the answer is `200` at once. An edit must send a higher `content_version`.
 - Images are sent as links, not files: the post body has no file and no base64 field. If you would rather not host the image, upload it first (see [Raw image uploads](#raw-image-uploads)). Cloudinary is only an example. Any storage works (S3, Azure Blob, your own CDN or a backend route served over https), as long as the link is `https` on a host in `IMAGE_ALLOWED_HOSTS`. The host match is exact, with no wildcards, and a signed query string is fine.
 - Image URLs must be `https` on a host in `IMAGE_ALLOWED_HOSTS`. Accepted types: JPEG, PNG, WebP and GIF, judged by file content. AVIF is not supported, so do not use Cloudinary's `f_auto`.
-- Animated images (GIF, WebP, APNG) are held until video checks exist.
-- Limits: 10 images of 10 MiB, caption 10,000 characters, image URL 2,048, callback URL 500.
+- Animated images (GIF, WebP, APNG) are checked frame by frame, like a video. On a deployment where the video pipeline is off, they are held.
+- Limits: 10 images of 10 MiB, caption 10,000 characters, image URL 2,048, callback URL 500. Videos: `API_MAX_VIDEOS` (1) per post, up to 300 seconds and `VIDEO_MAX_BYTES` (100 MiB, placeholder).
 
 ## Testing
 
@@ -498,11 +510,11 @@ pytest tests/integration -q
 
 | Suite | Count | Needs |
 |---|---|---|
-| Unit | 204 | nothing |
-| Integration | 21 | Postgres (uses a separate `moderation_test` database) |
-| Model | 22 | the downloaded models |
+| Unit | 329 | nothing |
+| Integration | 32 | Postgres (uses a separate `moderation_test` database) |
+| Model | 24 | the downloaded models |
 
-The unit suite passed on 3 November 2026 (204 tests). The integration and model suites last passed on 28 October 2026 and were not rerun after the OCR rule change and the removal of the calibration tools. The manual and end-to-end cases, with real GPU and CPU results, are in the Test Cases document (see [Documentation](#documentation)).
+Last full run, with D2: 385 tests passed (329 unit, 32 integration, 24 model), on 12 November 2026. The D2 tests use synthetic clips made at test time; the model tests need the downloaded weights. The manual and end-to-end cases, with real GPU and CPU results, are in the Test Cases document (see [Documentation](#documentation)).
 
 ## Performance
 
@@ -527,6 +539,7 @@ The handover documents are kept outside this repository and are shared separatel
 | Plan and handover | The design, what is built, open issues, next steps (section 16) |
 | Request flow diagram, module map | One-page pictures of a post's path and of the code modules |
 | Test cases | Every test case with its GPU and CPU result |
+| D2 compliance and test report | D2 checked against the plan, section by section, and the D2 test results (`docs/D2_Compliance_and_Test_Report.md`) |
 
 The live API reference is always at <http://localhost:8000/docs>. `testui/make_test_doc.py` regenerates the Test Cases document from `testui/cases.json` and `testui/results.json`.
 
@@ -535,7 +548,7 @@ The live API reference is always at <http://localhost:8000/docs>. `testui/make_t
 | Deliverable | Scope | State |
 |---|---|---|
 | D1 | General moderation on upload (posts: caption and images) | Implemented and tested |
-| D2 | Video | Not started |
+| D2 | Video: posts with video, stories, reels, animated images | Implemented and tested locally. Not yet deployed to the shared stack |
 | D3 | Halal categories, other content types, calibrated thresholds, human review | Not started |
 | D4 | Chat review | Not started |
 | D5 | Recommendations | Not started |
@@ -550,12 +563,21 @@ The live API reference is always at <http://localhost:8000/docs>. `testui/make_t
 - The models that read text in images cover Chinese, English and Japanese. Text in Arabic or Urdu is not read: if the models read fewer than 3 letters from it, the image is judged by the image model alone; if they read garbled letters, it is held as unreadable.
 - A post whose image URL stays dead fails after the retries, instead of being held.
 
+**Known limits of D2** (full list in section 2 of `docs/D2_Compliance_and_Test_Report.md`):
+
+- Audio is not checked, so spoken harm is missed. Urdu and Arabic on-screen text is not read.
+- Motion-based harm can hide between the sampled frames.
+- The starting video limits (scene and duplicate thresholds, hard-block categories, placeholder sizes) are not calibrated. Calibration is D3.
+- Speed is measured on one clip only. The plan's target (p95 of 20 s for a 60 s clip) is not measured yet.
+- The per-user video limit applies only to posts that carry an `author_id`.
+- Uploaded videos are read in place and kept. Downloaded videos and the copies made for animated images are temporary and are deleted after the check.
+
 ## Contributing
 
 - Work on a branch and open a pull request into `main`.
 - Before you push, run ruff, mypy and `pytest tests/unit` (see [Testing](#testing)) and keep them clean.
 - Never commit `.env` or model files. They are git-ignored.
-- Change `D1_POLICY.version` in `moderation/policy.py` whenever you change a rule: it is saved with every decision.
+- Change `D1_POLICY.version` in `moderation/policy.py` whenever you change a rule: it is saved with every decision. The current version is `d2.0.0`. The video thresholds are separate fields of the same policy (`video_default`, `video_overrides`).
 - After editing `IMAGE_PROMPTS` in `moderation/prompts.py`, run `python model_download.py build-head`.
 
 The models are third-party: Qwen3Guard, SigLIP2 and RapidOCR each have their own licence. Check them before any public release.

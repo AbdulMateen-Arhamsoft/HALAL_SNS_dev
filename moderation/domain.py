@@ -175,6 +175,4 @@ class ModerationRequest(BaseModel):
         ids = [image.media_id for image in self.images] + [video.media_id for video in self.videos]
         if len(ids) != len(set(ids)):
             raise ValueError("media_id must be unique within the request")
-        if self.videos and not self.author_id:
-            raise ValueError("author_id is required when the post has videos (it sets the per-user video limit)")
         return self

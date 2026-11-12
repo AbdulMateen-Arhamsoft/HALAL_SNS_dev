@@ -212,9 +212,12 @@ async def readyz(store: StoreDep):
 
 
 async def check_video_quota(store, body, cfg) -> None:
-    """The per-user limit (D2): an author may have VIDEO_MAX_PENDING_PER_USER video posts waiting or running."""
+    """The per-user limit (D2): an author may have VIDEO_MAX_PENDING_PER_USER video posts waiting or running.
+    It applies only when the post carries an author_id; without one there is no author to count."""
     if len(body.videos) > cfg.api_max_videos:
         raise Rejected(422, "limit_exceeded", f"too many videos: {len(body.videos)} > {cfg.api_max_videos}")
+    if body.author_id is None:
+        return
     pending = await store.count_pending_videos(body.author_id)
     if pending >= cfg.video_max_pending_per_user:
         raise Rejected(429, "rate_limited", f"{pending} videos are already waiting for this author; try again later")

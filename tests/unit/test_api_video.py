@@ -52,13 +52,14 @@ async def test_finished_video_post_answers_200() -> None:
     assert resp.json()["label"] == "allow"
 
 
-async def test_video_post_without_author_is_422() -> None:
+async def test_video_post_without_author_is_accepted_and_not_counted() -> None:
     body = video_body()
     del body["author_id"]
-    async with client_for(VideoStore()) as client:
+    store = VideoStore(pending=99)
+    async with client_for(store, video_max_pending_per_user=3) as client:
         resp = await client.post("/v1/moderations", json=body)
-    assert resp.status_code == 422
-    assert "author_id is required" in resp.text
+    assert resp.status_code == 202  # no author, so the per-user limit has nothing to count
+    assert store.counted == []
 
 
 @pytest.mark.parametrize("surface", ["story", "reel"])

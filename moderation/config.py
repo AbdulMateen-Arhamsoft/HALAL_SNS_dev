@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     video_max_pixels: int = Field(default=1920 * 1080, ge=1, description="PLACEHOLDER: largest frame size (width x height) accepted")
     video_fetch_timeout_s: float = Field(default=60.0, gt=0, description="HTTP timeout for one video download (whole download budget)")
     video_workers: int = Field(default=1, ge=1, le=1, description="Video jobs at once. Fixed at 1 by decision 11")
-    video_max_pending_per_user: int = Field(default=3, ge=1, description="PLACEHOLDER: videos one author may have waiting before 429 rate_limited")
+    video_max_pending_per_user: int = Field(default=3, ge=1, description="PLACEHOLDER: videos one author may have waiting before 429 rate_limited (only for posts that carry an author_id)")
     video_retention_days: int = Field(default=30, ge=1, description="PLACEHOLDER: days flagged-frame evidence is kept")
     video_temp_dir: str = Field(default="", description="Folder for temporary video copies. Empty uses the system temp folder")
     video_evidence_root: str = Field(default="evidence", description="Folder where flagged frames are saved as JPEG")
