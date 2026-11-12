@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from typing import Final, Literal, NamedTuple
 
@@ -7,6 +8,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DeviceRequest = Literal["auto", "cuda", "cpu"]
+_CATEGORY_CODE: Final = re.compile(r"G-0[1-7]")
 
 
 class ModelPin(NamedTuple):
@@ -70,7 +72,32 @@ class Settings(BaseSettings):
     image_max_bytes: int = Field(default=10 * 1024 * 1024, ge=1024, description="Largest image accepted")
     fetch_timeout_s: float = Field(default=5.0, gt=0, description="HTTP timeout for one image download")
 
+    # --- Video (D2) ---
+    # Limits from plan section 9. Placeholders are marked; they need confirming before production.
+    video_max_duration_s: int = Field(default=300, ge=1, le=3600, description="Longest video accepted; longer is held as media_too_long")
+    video_sample_fps: float = Field(default=1.0, gt=0, le=30, description="Frames kept per second of video (sampling step)")
+    video_max_frames: int = Field(default=240, ge=1, le=2000, description="Most frames checked per video; scene-change frames are kept first")
+    video_frame_side: int = Field(default=384, ge=32, le=1024, description="Side length of each frame given to the models, in pixels")
+    video_scene_threshold: float = Field(default=30.0, gt=0, le=255, description="Mean grey difference that counts as a scene change (assumption, tune later)")
+    video_dedup_distance: int = Field(default=5, ge=0, le=64, description="Hash distance (of 64 bits) at or below which a frame is a duplicate (assumption, tune later)")
+    video_max_bytes: int = Field(default=100 * 1024 * 1024, ge=1024, description="PLACEHOLDER: largest video file accepted")
+    video_max_pixels: int = Field(default=1920 * 1080, ge=1, description="PLACEHOLDER: largest frame size (width x height) accepted")
+    video_fetch_timeout_s: float = Field(default=60.0, gt=0, description="HTTP timeout for one video download (whole download budget)")
+    video_workers: int = Field(default=1, ge=1, le=1, description="Video jobs at once. Fixed at 1 by decision 11")
+    video_max_pending_per_user: int = Field(default=3, ge=1, description="PLACEHOLDER: videos one author may have waiting before 429 rate_limited")
+    video_retention_days: int = Field(default=30, ge=1, description="PLACEHOLDER: days flagged-frame evidence is kept")
+    video_temp_dir: str = Field(default="", description="Folder for temporary video copies. Empty uses the system temp folder")
+    video_evidence_root: str = Field(default="evidence", description="Folder where flagged frames are saved as JPEG")
+    video_hard_block_categories: str = Field(
+        default="G-01,G-03,G-05",
+        description="Categories where one flagged frame is enough (maximum). Others use the mean of the 3 worst frames",
+    )
+    video_text_unreadable_share: float = Field(
+        default=0.5, gt=0, le=1, description="Hold the video when more than this share of text-bearing frames cannot be read"
+    )
+
     # --- API ---
+    api_max_videos: int = Field(default=1, ge=0, le=10, description="Videos per post. 1 to start (plan section 7)")
     api_max_body_bytes: int = Field(default=128 * 1024, ge=1024, description="Largest request body accepted, checked before it is read")
     api_max_images: int = Field(default=10, ge=0, description="Maximum images per request")
     api_max_text_chars: int = Field(default=10_000, ge=1, description="Maximum caption length")
@@ -93,6 +120,15 @@ class Settings(BaseSettings):
     @property
     def allowed_hosts(self) -> frozenset[str]:
         return frozenset(h.strip().lower() for h in self.image_allowed_hosts.split(",") if h.strip())
+
+    @property
+    def video_hard_block_codes(self) -> frozenset[str]:
+        """VIDEO_HARD_BLOCK_CATEGORIES parsed and checked. An unknown code is an error, never ignored."""
+        codes = frozenset(c.strip().upper() for c in self.video_hard_block_categories.split(",") if c.strip())
+        unknown = sorted(c for c in codes if not _CATEGORY_CODE.fullmatch(c))
+        if unknown:
+            raise ValueError(f"VIDEO_HARD_BLOCK_CATEGORIES has unknown codes {unknown}; use G-01 to G-07")
+        return codes
 
     @property
     def api_key_names(self) -> dict[str, str]:

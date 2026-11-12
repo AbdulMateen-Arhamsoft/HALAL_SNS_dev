@@ -25,6 +25,7 @@ pillow==13.0.0
 numpy==2.5.4
 rapidocr==3.10.0
 onnxruntime==1.31.0
+av==19.0.2
 
 # checks
 pytest==9.1.1
