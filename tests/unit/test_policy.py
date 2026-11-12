@@ -22,7 +22,8 @@ def policy() -> Policy:
 
 
 def test_default_policy_values(policy: Policy) -> None:
-    assert policy.version == "d1.6.1"
+    # D2 change (plan section 6): the version is raised after every policy edit, as D1 requires.
+    assert policy.version == "d2.0.0"
     assert policy.ocr_min_confidence == 0.6
     assert policy.ocr_min_chars == 3
 
@@ -34,7 +35,13 @@ def test_post_is_accepted(policy: Policy) -> None:
     assert policy.accepts("post")
 
 
-@pytest.mark.parametrize("surface", ["POST", "unknown", "", "post ", "comment", "dm", "reel"])
+@pytest.mark.parametrize("surface", ["story", "reel"])
+def test_video_surfaces_are_accepted_from_d2(policy: Policy, surface: str) -> None:
+    # D2 change (plan section 6): stories and reels are checked like posts, with video.
+    assert policy.accepts(surface)
+
+
+@pytest.mark.parametrize("surface", ["POST", "unknown", "", "post ", "comment", "dm"])
 def test_surfaces_outside_d1_are_not_accepted(policy: Policy, surface: str) -> None:
     assert not policy.accepts(surface)
 

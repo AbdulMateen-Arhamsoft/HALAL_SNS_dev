@@ -19,6 +19,8 @@ class ItemSource(StrEnum):
     TEXT = "text"
     IMAGE = "image"
     IMAGE_TEXT = "image_text"
+    VIDEO = "video"  # D2: the combined frame scores of one video
+    VIDEO_TEXT = "video_text"  # D2: on-screen text of a video's frames
 
 
 # Harm categories G-01 to G-07. D3 adds the halal codes H-01 to H-06 here.

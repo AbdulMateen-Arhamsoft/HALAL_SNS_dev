@@ -18,6 +18,7 @@ MEDIA_TOO_LARGE = "media_too_large"
 MEDIA_UNSUPPORTED = "media_unsupported"
 MEDIA_FORBIDDEN = "media_forbidden"
 MEDIA_UNDECODABLE = "media_undecodable"
+MEDIA_TOO_LONG = "media_too_long"  # D2: a video longer than VIDEO_MAX_DURATION_S
 MODEL_OOM = "model_oom"
 ATTEMPTS_EXHAUSTED = "attempts_exhausted"
 INTERNAL_ERROR = "internal_error"

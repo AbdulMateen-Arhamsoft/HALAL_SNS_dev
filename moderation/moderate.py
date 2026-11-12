@@ -151,6 +151,10 @@ class Moderator:
         rejected.append(RejectedImage(media_id, code, detail))
         return ItemResult(ItemSource.IMAGE, media_id, Label.HOLD, None, None, f"Image {media_id}: {detail}")
 
+    async def judge_texts(self, texts: list[str]) -> list[list[ItemResult]]:
+        """Public for the video checker: on-screen text is judged by exactly the caption rules."""
+        return await self._judge_texts(texts)
+
     async def _judge_texts(self, texts: list[str]) -> list[list[ItemResult]]:
         """Each cleaned text: its worst segment verdict, plus a hold for prompt-like text.
         All segments of all texts go to the model in one call."""
@@ -206,6 +210,10 @@ def build_reason(item: ItemResult) -> str:
         where = "Caption"
     elif item.source is ItemSource.IMAGE_TEXT:
         where = f"Text in image {item.media_id}"
+    elif item.source is ItemSource.VIDEO_TEXT:
+        where = f"Text in video {item.media_id}"
+    elif item.source is ItemSource.VIDEO:
+        where = f"Video {item.media_id}"
     else:
         where = f"Image {item.media_id}"
     return f"{where}: {name}"

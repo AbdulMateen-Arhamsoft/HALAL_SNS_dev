@@ -52,6 +52,9 @@ class Policy:
     # ignored, whatever the box count. Otherwise below ocr_min_confidence it is unreadable, so hold.
     ocr_min_confidence: float = 0.6
     ocr_min_chars: int = 3
+    # D2: video thresholds, copies of the image ones at start (decision 13). Tuned in D3 on their own.
+    video_default: Threshold = Threshold(hold=0.5, block=0.85)
+    video_overrides: Mapping[str, Threshold] = field(default_factory=dict)
 
     def accepts(self, surface: str) -> bool:
         return surface in self.surfaces
@@ -69,12 +72,27 @@ class Policy:
 
     def judge_image(self, media_id: str, scores: Mapping[str, float]) -> ItemResult:
         """Highest-severity category wins. Ties go to the higher score. A broken score holds."""
+        return self._judge(ItemSource.IMAGE, media_id, scores, self.image_default, self.image_overrides)
+
+    def judge_video(self, media_id: str, scores: Mapping[str, float]) -> ItemResult:
+        """Same rule as images, with the video thresholds (copies of the image ones at D2 start, decision 13).
+        `scores` is the combined score per category for the whole video (check.combine_scores)."""
+        return self._judge(ItemSource.VIDEO, media_id, scores, self.video_default, self.video_overrides)
+
+    def _judge(
+        self,
+        source: ItemSource,
+        media_id: str,
+        scores: Mapping[str, float],
+        default: Threshold,
+        overrides: Mapping[str, Threshold],
+    ) -> ItemResult:
         if any(code not in scores or not math.isfinite(scores[code]) for code in CATEGORIES):
-            return ItemResult(ItemSource.IMAGE, media_id, Label.HOLD, None, None)
+            return ItemResult(source, media_id, Label.HOLD, None, None)
         best: ItemResult | None = None
         for code in CATEGORIES:
             value = scores[code]
-            threshold = self.image_overrides.get(code, self.image_default)
+            threshold = overrides.get(code, default)
             if value >= threshold.block:
                 level = Label.BLOCK
             elif value >= threshold.hold:
@@ -82,10 +100,10 @@ class Policy:
             else:
                 continue
             if best is None or (_SEVERITY[level], value) > (_SEVERITY[best.label], best.score or 0.0):
-                best = ItemResult(ItemSource.IMAGE, media_id, level, code, value)
+                best = ItemResult(source, media_id, level, code, value)
         if best is not None:
             return best
-        return ItemResult(ItemSource.IMAGE, media_id, Label.ALLOW, None, max(scores[c] for c in CATEGORIES))
+        return ItemResult(source, media_id, Label.ALLOW, None, max(scores[c] for c in CATEGORIES))
 
 
 def worst_item(items: Sequence[ItemResult]) -> ItemResult:
@@ -98,8 +116,9 @@ def worst_item(items: Sequence[ItemResult]) -> ItemResult:
 
 
 D1_POLICY = Policy(
-    version="d1.6.1",
-    surfaces=frozenset({"post"}),
+    version="d2.0.0",
+    # D2 adds the video surfaces: a story and a reel are checked like a post, with video.
+    surfaces=frozenset({"post", "story", "reel"}),
     tier_labels={"Safe": Label.ALLOW, "Controversial": Label.HOLD, "Unsafe": Label.BLOCK},
     qwen_codes={
         "Violent": "G-01",
@@ -116,6 +135,13 @@ D1_POLICY = Policy(
     # Chosen from the scan of 347 pictures (local calibration run, since removed): clean pictures flagged fell from 7% to 2.5%.
     # G-03 separates well; G-02 separates poorly; G-01 had only 2 pictures. G-04..G-07 had none and keep the default.
     image_overrides={
+        "G-01": Threshold(hold=0.60, block=0.85),
+        "G-02": Threshold(hold=0.60, block=0.85),
+        "G-03": Threshold(hold=0.80, block=0.95),
+    },
+    # D2 copies of the image thresholds (decision 13): video frames are scored by the same SigLIP 2.
+    video_default=Threshold(hold=0.5, block=0.85),
+    video_overrides={
         "G-01": Threshold(hold=0.60, block=0.85),
         "G-02": Threshold(hold=0.60, block=0.85),
         "G-03": Threshold(hold=0.80, block=0.95),
