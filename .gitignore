@@ -60,3 +60,9 @@ local/eval_text_last.json
 /evidence/
 
 /tmp-video/
+
+# D2 test videos (large; some show violence)
+/tests/video_test-dataset/
+
+# D2 benchmark results (generated; not committed)
+/tests/results/
