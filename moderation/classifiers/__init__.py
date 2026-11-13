@@ -6,6 +6,7 @@ import asyncio
 import functools
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 from moderation.errors import MODEL_OOM, RetryableError
 
@@ -21,6 +22,39 @@ class SingleThread:
 
     def close(self) -> None:
         self._executor.shutdown(wait=True)
+
+
+class OcrPool:
+    """Several independent OCR engines (CPU), so that several videos can be read at the same time.
+
+    One RapidOCR engine must not be called from two threads at once, so each engine keeps its own thread
+    and a call borrows a free engine. With one engine this behaves like the engine itself. The engines
+    are small ONNX models on the CPU: unlike the GPU models, a copy costs little memory."""
+
+    def __init__(self, engines: Sequence[Any]) -> None:
+        if not engines:
+            raise ValueError("an OCR pool needs at least one engine")
+        self._engines = list(engines)
+        self._free: asyncio.Queue[Any] | None = None  # built on first use, inside the running event loop
+
+    @property
+    def size(self) -> int:
+        return len(self._engines)
+
+    async def read(self, images: Sequence[bytes]) -> list[Any]:
+        if self._free is None:
+            self._free = asyncio.Queue()
+            for engine in self._engines:
+                self._free.put_nowait(engine)
+        engine = await self._free.get()
+        try:
+            return list(await engine.read(images))
+        finally:
+            self._free.put_nowait(engine)
+
+    def close(self) -> None:
+        for engine in self._engines:
+            engine.close()
 
 
 def split_on_oom[S, T, R](fn: Callable[[S, Sequence[T]], list[R]]) -> Callable[[S, Sequence[T]], list[R]]:

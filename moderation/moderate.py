@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+import contextlib
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -65,6 +67,33 @@ REJECT_VIDEO_DETAILS = {
 }
 
 
+class VideoGate:
+    """Which videos may use the CPU and which may wait for the GPU, for the whole worker process.
+
+    `cpu`: videos being prepared at once (download, decode, pick frames, read text).
+    `waiting`: prepared videos that hold their frames while the GPU scores earlier ones. When it is full a
+    prepared video keeps its CPU slot, so no further video is started: that is the memory limit.
+    The counters show how much is held while videos wait (logged, and read by the tests)."""
+
+    def __init__(self, parallel: int, max_waiting: int) -> None:
+        self.cpu = asyncio.Semaphore(parallel)
+        self.waiting = asyncio.Semaphore(max_waiting)
+        self.waiting_videos = 0
+        self.waiting_bytes = 0
+        self.peak_waiting_videos = 0
+        self.peak_waiting_bytes = 0
+
+    def enter_waiting(self, nbytes: int) -> None:
+        self.waiting_videos += 1
+        self.waiting_bytes += nbytes
+        self.peak_waiting_videos = max(self.peak_waiting_videos, self.waiting_videos)
+        self.peak_waiting_bytes = max(self.peak_waiting_bytes, self.waiting_bytes)
+
+    def leave_waiting(self, nbytes: int) -> None:
+        self.waiting_videos -= 1
+        self.waiting_bytes -= nbytes
+
+
 @dataclass(frozen=True)
 class VideoPipeline:
     """Everything a worker needs to check a video. None on a Moderator means videos are not checked (D1)."""
@@ -72,6 +101,23 @@ class VideoPipeline:
     cfg: Settings
     fetcher: VideoFetcher
     checker: VideoChecker
+    gate: VideoGate = field(default=None)  # type: ignore[assignment]  # built from cfg in __post_init__
+
+    def __post_init__(self) -> None:
+        if self.gate is None:
+            object.__setattr__(self, "gate", VideoGate(self.cfg.video_parallel, self.cfg.video_max_waiting))
+
+
+@dataclass(frozen=True)
+class PreparedVideo:
+    """A video after its CPU steps: the frames to score and the text already read from them."""
+
+    selection: Any  # moderation.video.frames.Selection
+    ocr: list[OcrResult]
+
+    @property
+    def nbytes(self) -> int:
+        return sum(len(frame.jpeg) for frame in self.selection.frames)
 
 
 @dataclass
@@ -149,25 +195,62 @@ class Moderator:
         )
 
     async def moderate_videos(self, videos: Sequence[VideoRef], sink: VideoSink) -> None:
-        """Each video: download (temporary copy, always deleted), probe, pick frames, check. A video that cannot
-        be checked is held and listed in rejected_videos; the other videos are still checked."""
-        for video in videos:
-            assert self._video is not None  # moderate() refuses videos without the pipeline
-            try:
-                async with self._video.fetcher.download(video.url) as path:
-                    await self._check_video_path(video.media_id, path, sink)
-            except PermanentError as exc:
-                self._reject_video(video.media_id, exc, sink)
+        """All the videos of a post are checked at the same time, within the worker's CPU and waiting limits.
+        A video that cannot be checked is held and listed in rejected_videos; the other videos are still checked.
+        Any other error stops the rest and propagates, so the whole job is retried."""
+        if not videos:
+            return
+        assert self._video is not None  # moderate() refuses videos without the pipeline
+        parts = [VideoSink() for _ in videos]
+        tasks = [asyncio.create_task(self._moderate_downloaded(video, part)) for video, part in zip(videos, parts, strict=True)]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)  # let each one delete its temporary copy
+            raise
+        for part in parts:  # in the order sent, so the answer never depends on which video finished first
+            sink.items.extend(part.items)
+            sink.rejected.extend(part.rejected)
+            sink.frames.extend(part.frames)
 
-    async def _check_video_path(self, media_id: str, path: Path, sink: VideoSink) -> tuple[ItemResult, ...]:
-        """The frame pipeline on one local file. Raises PermanentError when the file cannot be checked."""
+    async def _moderate_downloaded(self, video: VideoRef, sink: VideoSink) -> None:
         assert self._video is not None
-        cfg = self._video.cfg
-        info = await asyncio.to_thread(probe, path, cfg)
-        selection = await asyncio.to_thread(select_frames, path, cfg, info)
-        verdict = await self._video.checker.check(media_id, selection.frames)
+        try:
+            await self._prepare_then_score(video.media_id, self._video.fetcher.download(video.url), sink)
+        except PermanentError as exc:
+            self._reject_video(video.media_id, exc, sink)
+
+    async def _prepare_then_score(
+        self, media_id: str, source: AbstractAsyncContextManager[Path], sink: VideoSink
+    ) -> tuple[ItemResult, ...]:
+        """One video, in two stages.
+
+        CPU stage (many videos at once, `gate.cpu`): the file is downloaded, probed, its frames picked and its text
+        read. The file is deleted as soon as the frames are picked, so a waiting video holds only its JPEG frames.
+        GPU stage (one video at a time, because the models take one call at a time): the frames are scored and the
+        text judged. A prepared video waits in line for it, and `gate.waiting` limits how many may wait."""
+        assert self._video is not None
+        gate, checker = self._video.gate, self._video.checker
+        holding = False
+        entered = 0
+        try:
+            async with gate.cpu:
+                async with source as path:
+                    prepared = await self._prepare_frames(path)
+                await gate.waiting.acquire()  # full: this video keeps its CPU slot, so no new video starts
+                holding = True
+            entered = prepared.nbytes
+            gate.enter_waiting(entered)
+            verdict = await checker.check(media_id, prepared.selection.frames, prepared.ocr)
+        finally:
+            if entered:
+                gate.leave_waiting(entered)
+            if holding:
+                gate.waiting.release()
         sink.items.extend(verdict.items)
-        for frame, result in zip(selection.frames, verdict.frames, strict=True):
+        for frame, result in zip(prepared.selection.frames, verdict.frames, strict=True):
             sink.frames.append(
                 VideoFrameRecord(
                     media_id=media_id,
@@ -180,6 +263,15 @@ class Moderator:
                 )
             )
         return verdict.items
+
+    async def _prepare_frames(self, path: Path) -> PreparedVideo:
+        """The CPU steps on one local file. Raises PermanentError when the file cannot be checked."""
+        assert self._video is not None
+        cfg = self._video.cfg
+        info = await asyncio.to_thread(probe, path, cfg)
+        selection = await asyncio.to_thread(select_frames, path, cfg, info)
+        ocr = await self._video.checker.read_text(selection.frames)
+        return PreparedVideo(selection, ocr)
 
     @staticmethod
     def _reject_video(media_id: str, exc: PermanentError, sink: VideoSink) -> None:
@@ -244,14 +336,21 @@ class Moderator:
     ) -> ItemResult:
         """Run an animated image through the frame pipeline. Its own temporary copy is deleted in `finally`."""
         assert self._video is not None
-        path = await asyncio.to_thread(write_temp_copy, blob, self._video.cfg)
         try:
-            verdict_items = await self._check_video_path(media_id, path, sink)
+            verdict_items = await self._prepare_then_score(media_id, self._temp_copy(blob), sink)
         except PermanentError as exc:
             return self._reject(media_id, exc.code, rejected)
+        return worst_item(list(verdict_items))
+
+    @contextlib.asynccontextmanager
+    async def _temp_copy(self, blob: bytes) -> AsyncIterator[Path]:
+        """The animated image written to a temporary file, deleted when the block ends."""
+        assert self._video is not None
+        path = await asyncio.to_thread(write_temp_copy, blob, self._video.cfg)
+        try:
+            yield path
         finally:
             path.unlink(missing_ok=True)
-        return worst_item(list(verdict_items))
 
     async def _fetch(self, image: ImageRef) -> bytes | PermanentError:
         """A permanent fetch problem is about this image only. A retryable one still retries the whole job."""

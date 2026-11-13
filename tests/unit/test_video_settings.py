@@ -22,8 +22,10 @@ def test_defaults_match_the_plan() -> None:
     assert cfg.video_frame_side == 384  # section 4.6
     assert cfg.video_scene_threshold == 30  # decision 3, assumption
     assert cfg.video_dedup_distance == 5  # decision 4, assumption
-    assert cfg.video_workers == 1  # decision 11
-    assert cfg.api_max_videos == 1  # section 7
+    assert cfg.video_workers == 3  # raised from 1: videos are prepared in parallel, scored one at a time on the GPU
+    assert cfg.video_parallel == 3
+    assert cfg.video_max_waiting == 4
+    assert cfg.api_max_videos == 3  # the plan (section 7) started at 1; 3 by decision, changeable by configuration
     assert cfg.video_hard_block_codes == frozenset({"G-01", "G-03", "G-05"})  # open item 4, proposed
 
 
@@ -46,10 +48,15 @@ def test_placeholders_have_values() -> None:
         ("video_frame_side", 16),
         ("video_scene_threshold", 0),
         ("video_dedup_distance", 65),
-        ("video_workers", 2),  # fixed at 1 by decision 11
+        ("video_workers", 0),
+        ("video_workers", 9),
+        ("video_parallel", 0),
+        ("video_parallel", 9),
+        ("video_max_waiting", 0),
+        ("video_max_waiting", 17),
         ("video_text_unreadable_share", 0),
         ("video_text_unreadable_share", 1.5),
-        ("api_max_videos", 11),
+        ("api_max_videos", 101),
     ],
 )
 def test_out_of_range_values_are_refused(field: str, value: object) -> None:

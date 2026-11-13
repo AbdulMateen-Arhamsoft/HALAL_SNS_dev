@@ -83,7 +83,9 @@ class Settings(BaseSettings):
     video_max_bytes: int = Field(default=100 * 1024 * 1024, ge=1024, description="PLACEHOLDER: largest video file accepted")
     video_max_pixels: int = Field(default=1920 * 1080, ge=1, description="PLACEHOLDER: largest frame size (width x height) accepted")
     video_fetch_timeout_s: float = Field(default=60.0, gt=0, description="HTTP timeout for one video download (whole download budget)")
-    video_workers: int = Field(default=1, ge=1, le=1, description="Video jobs at once. Fixed at 1 by decision 11")
+    video_workers: int = Field(default=3, ge=1, le=8, description="Video jobs claimed at once (loops in one process, one copy of the models)")
+    video_parallel: int = Field(default=3, ge=1, le=8, description="Videos prepared on the CPU at once (download, decode, pick frames, read text). One OCR engine each")
+    video_max_waiting: int = Field(default=4, ge=1, le=16, description="Prepared videos allowed to wait for the GPU. When full, the CPU work pauses (a hard memory limit)")
     video_max_pending_per_user: int = Field(default=3, ge=1, description="PLACEHOLDER: videos one author may have waiting before 429 rate_limited (only for posts that carry an author_id)")
     video_retention_days: int = Field(default=30, ge=1, description="PLACEHOLDER: days flagged-frame evidence is kept")
     video_temp_dir: str = Field(default="", description="Folder for temporary video copies. Empty uses the system temp folder")
@@ -97,7 +99,7 @@ class Settings(BaseSettings):
     )
 
     # --- API ---
-    api_max_videos: int = Field(default=1, ge=0, le=10, description="Videos per post. 1 to start (plan section 7)")
+    api_max_videos: int = Field(default=3, ge=0, le=100, description="Videos per post. 3 for now; change it here (or in .env) to any number up to 100")
     api_max_body_bytes: int = Field(default=128 * 1024, ge=1024, description="Largest request body accepted, checked before it is read")
     api_max_images: int = Field(default=10, ge=0, description="Maximum images per request")
     api_max_text_chars: int = Field(default=10_000, ge=1, description="Maximum caption length")

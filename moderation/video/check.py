@@ -100,19 +100,30 @@ class VideoChecker:
         self._hard_block = hard_block
         self._text_unreadable_share = text_unreadable_share
 
-    async def check(self, media_id: str, frames: Sequence[Frame]) -> VideoVerdict:
+    async def read_text(self, frames: Sequence[Frame]) -> list[OcrResult]:
+        """The words on screen, frame by frame. CPU only: no GPU model is used, so several videos can do this
+        at the same time (each borrows its own OCR engine)."""
+        return await _in_batches(self._ocr.read, [frame.jpeg for frame in frames], SCORE_BATCH)
+
+    async def check(
+        self, media_id: str, frames: Sequence[Frame], ocr_results: Sequence[OcrResult] | None = None
+    ) -> VideoVerdict:
+        """Score the frames (GPU), judge their text (GPU) and combine. `ocr_results` comes from `read_text`
+        when the worker already did that step on the CPU; without it the text is read here."""
         if not frames:
             raise ValueError("a video with no frames cannot be checked")
         jpegs = [frame.jpeg for frame in frames]
         timings: dict[str, float] = {}
 
         started = time.perf_counter()
+        if ocr_results is None:
+            ocr_results = await self.read_text(frames)
+            timings["ocr_s"] = time.perf_counter() - started
+            started = time.perf_counter()
+        elif len(ocr_results) != len(frames):
+            raise ValueError("one text result is needed for each frame")
         scores = await self._score_frames(jpegs)
         timings["score_s"] = time.perf_counter() - started
-
-        started = time.perf_counter()
-        ocr_results = await _in_batches(self._ocr.read, jpegs, SCORE_BATCH)
-        timings["ocr_s"] = time.perf_counter() - started
 
         started = time.perf_counter()
         text_items, states = await self._judge_video_text(media_id, ocr_results)

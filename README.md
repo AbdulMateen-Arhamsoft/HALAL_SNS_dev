@@ -66,7 +66,7 @@ sequenceDiagram
 7. One database statement saves the decision and marks the job done.
 8. The API answers `200` with the decision (or with the failure), or `202 {job_id, status}` if the check is slower than the wait. After a `202` the backend polls `GET /v1/moderations/{job_id}` or waits for the callback. If `callback_url` was sent, the callback is also POSTed (optional, 5 s limit), and retried after 1, 5, 30, 120 and 600 s, up to 10 tries.
 
-**Videos (D2).** A post with a `videos` entry goes to the `video` lane, which has its own worker loop (`VIDEO_WORKERS` = 1). The API answers `202` at once, and the decision comes by callback or `GET`. The worker downloads the video (a temporary copy, always deleted), checks its length, size, resolution and format, picks the frames, and checks them. A video that cannot be checked is held and listed in `rejected_videos`; it is never allowed. Animated images (GIF, animated WebP, APNG) take the same path.
+**Videos (D2).** A post with a `videos` entry goes to the `video` lane, which has its own worker loops (`VIDEO_WORKERS` = 3, sharing one copy of the models). The API answers `202` at once, and the decision comes by callback or `GET`. The worker downloads the video (a temporary copy, deleted as soon as the frames are picked), checks its length, size, resolution and format, picks the frames, reads the text on screen, and then scores the frames. The CPU steps (download, decode, pick frames, read text) run for up to `VIDEO_PARALLEL` (3) videos at once, each with its own OCR engine; the GPU steps (SigLIP 2 and Qwen3Guard) take one video at a time. At most `VIDEO_MAX_WAITING` (4) prepared videos may wait for the GPU, holding only their JPEG frames; when that is full the CPU work pauses, which is the memory limit. The videos of one post are checked together, and the answer keeps the order they were sent in. Measured on 36 real clips on an RTX 3050: 51 videos a minute one at a time, 98 with 3 in parallel, 111 with a burst of 36 at once, with the same decisions in every run. A video that cannot be checked is held and listed in `rejected_videos`; it is never allowed. Animated images (GIF, animated WebP, APNG) take the same path.
 
 **When something goes wrong.** A temporary problem retries the job after 5, 15, 60 and 300 s, then fails it with an `error_code`. A permanent problem answers `200` with `status: failed` (and sends a `moderation.failed` callback if one was asked for). A worker crash requeues the job after the lease ends. If the database is down, the API answers `503` within 5 s.
 
@@ -323,7 +323,7 @@ Body fields. A field that is not listed is refused (`422`), so do not send extra
 | `images` | list of up to 10 objects | one of `text` or `images` | The images to check. Each object has `media_id` and `url` (next rows). |
 | `images[].media_id` | string, 1 to 128 characters | yes, per image | Your id for the image. Must be unique within the request. Comes back in `rejected_images` and in the reason. |
 | `images[].url` | string, up to 2,048 characters | yes, per image | Where the checker downloads the image. `https`, on a host in `IMAGE_ALLOWED_HOSTS`. |
-| `videos` | list of up to `API_MAX_VIDEOS` (1) objects | one of `text`, `images` or `videos` | The videos to check (D2). Each object has `media_id` and `url`, like an image. A post with a video is answered `202` at once. |
+| `videos` | list of up to `API_MAX_VIDEOS` (3) objects | one of `text`, `images` or `videos` | The videos to check (D2). Each object has `media_id` and `url`, like an image. A post with a video is answered `202` at once. |
 | `videos[].media_id` | string, 1 to 128 characters | yes, per video | Your id for the video. Must be unique within the request, across images and videos. |
 | `videos[].url` | string, 1 to 2,048 characters | yes, per video | Where the checker downloads the video: `https` on a host in `IMAGE_ALLOWED_HOSTS`, or the `url` returned by `POST /v1/moderations/uploads/video`. |
 | `callback_url` | URL, up to 500 characters | no | Where the checker POSTs the decision. Leave it out to poll with `GET` instead. See "Receive the callback" below. |
@@ -483,7 +483,7 @@ Errors the API makes itself have the shape `{"error": "...", "detail": "..."}`. 
 - Images are sent as links, not files: the post body has no file and no base64 field. If you would rather not host the image, upload it first (see [Raw image uploads](#raw-image-uploads)). Cloudinary is only an example. Any storage works (S3, Azure Blob, your own CDN or a backend route served over https), as long as the link is `https` on a host in `IMAGE_ALLOWED_HOSTS`. The host match is exact, with no wildcards, and a signed query string is fine.
 - Image URLs must be `https` on a host in `IMAGE_ALLOWED_HOSTS`. Accepted types: JPEG, PNG, WebP and GIF, judged by file content. AVIF is not supported, so do not use Cloudinary's `f_auto`.
 - Animated images (GIF, WebP, APNG) are checked frame by frame, like a video. On a deployment where the video pipeline is off, they are held.
-- Limits: 10 images of 10 MiB, caption 10,000 characters, image URL 2,048, callback URL 500. Videos: `API_MAX_VIDEOS` (1) per post, up to 300 seconds and `VIDEO_MAX_BYTES` (100 MiB, placeholder).
+- Limits: 10 images of 10 MiB, caption 10,000 characters, image URL 2,048, callback URL 500. Videos: `API_MAX_VIDEOS` (3) per post, up to 300 seconds and `VIDEO_MAX_BYTES` (100 MiB, placeholder).
 
 ## Testing
 
@@ -514,7 +514,7 @@ pytest tests/integration -q
 | Integration | 32 | Postgres (uses a separate `moderation_test` database) |
 | Model | 24 | the downloaded models |
 
-Last full run, with D2: 385 tests passed (329 unit, 32 integration, 24 model), on 12 November 2026. The D2 tests use synthetic clips made at test time; the model tests need the downloaded weights. The manual and end-to-end cases, with real GPU and CPU results, are in the Test Cases document (see [Documentation](#documentation)).
+Last full run, with D2: 385 tests passed (329 unit, 32 integration, 24 model), on 12 November 2026. After the parallel video change (13 November 2026) the unit suite has 345 tests and passes; the integration tests were not re-run, because the store is unchanged. The D2 tests use synthetic clips made at test time; the model tests need the downloaded weights. The manual and end-to-end cases, with real GPU and CPU results, are in the Test Cases document (see [Documentation](#documentation)).
 
 ## Performance
 

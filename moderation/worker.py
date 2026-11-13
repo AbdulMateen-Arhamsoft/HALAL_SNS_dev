@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Literal
 
 import httpx
 
+from moderation.classifiers import OcrPool
 from moderation.config import MODEL_PINS, DeviceRequest, Settings, get_settings
 from moderation.domain import CATEGORIES, UNCLASSIFIED, Decision
 from moderation.errors import INTERNAL_ERROR, PermanentError, RetryableError
@@ -416,6 +417,15 @@ def load_models(cfg: Settings) -> tuple[Qwen3GuardClassifier, SiglipImageClassif
     return text, image, ocr
 
 
+def load_video_ocr(cfg: Settings) -> OcrPool:
+    """`video_parallel` OCR engines for video frames (CPU). Blocking: run it in a thread."""
+    from moderation.classifiers.ocr_rapidocr import RapidOcrEngine
+
+    engines = [RapidOcrEngine(Path(cfg.ocr_model_dir), threads=cfg.ocr_threads) for _ in range(cfg.video_parallel)]
+    log.info("video OCR ready", extra={"engines": len(engines), "threads_each": cfg.ocr_threads})
+    return OcrPool(engines)
+
+
 def read_model_versions(cfg: Settings) -> dict[str, str]:
     """What produced each decision: the pinned revisions, the head build, the OCR files.
     Read once at start and saved with every decision, for D3 calibration and appeals."""
@@ -457,9 +467,13 @@ async def serve(cfg: Settings) -> None:
             policy=D1_POLICY,
             model_versions=read_model_versions(cfg),
         )
+        # Video reads text on the CPU with its own engines, one per video prepared at once, apart from the D1 engine,
+        # so a long video never makes a caption or image wait for OCR.
+        video_ocr = await asyncio.to_thread(load_video_ocr, cfg)
+        stack.callback(video_ocr.close)
         checker = VideoChecker(
             image=image,
-            ocr=ocr,
+            ocr=video_ocr,
             judge_texts=moderator.judge_texts,
             policy=D1_POLICY,
             hard_block=cfg.video_hard_block_codes,
