@@ -12,9 +12,11 @@ FROM base AS api
 
 # Dependencies first, from pyproject.toml alone, so a code change does not reinstall them.
 COPY pyproject.toml ./
-RUN mkdir moderation && touch moderation/__init__.py && pip install . && rm -rf moderation build
+RUN mkdir moderation recommendation && touch moderation/__init__.py recommendation/__init__.py app.py     && pip install . && rm -rf moderation recommendation app.py build
 
+COPY app.py ./app.py
 COPY moderation ./moderation
+COPY recommendation ./recommendation
 COPY migrations ./migrations
 RUN pip install --no-deps .
 
@@ -24,7 +26,7 @@ USER app
 
 EXPOSE 8000
 
-CMD ["uvicorn", "moderation.api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
 
 # ---- worker: loads the models once at startup --------------------------------
 FROM base AS worker

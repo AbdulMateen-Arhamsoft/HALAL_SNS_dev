@@ -1,25 +1,30 @@
-# Halal SNS Moderation Checker
+# Halal SNS AI: moderation + recommendation
+
+One service with two features behind one HTTP API: **moderation** (checks a post before it is published) and **recommendation** (ranks the feed for one user). The two never call each other; the backend connects them (see [Recommendation](#recommendation)).
+
+## Moderation
 
 Automatic content moderation for the Halal SNS platform. The backend sends a post (a caption, image URLs and, for posts with a video, a video URL). The checker checks the post and answers the same request, normally within a second or two, with whether to **allow**, **hold** or **block** it, a category and a one-line reason. If a check is slower than 10 s, the answer is `202` and the decision is read later.
 
-**Status:** D1 (images and text) and D2 (video, stories and reels) are implemented and tested. D2 has not yet been deployed to the shared stack. See [Project status](#project-status).
+**Status:** D1 (images and text), D2 (video, stories and reels) and D5 (recommendation, rules version) are implemented and tested. D2 has not yet been deployed to the shared stack. See [Project status](#project-status).
 
 ## Contents
 
 1. [How it works](#how-it-works)
 2. [What happens when you call the endpoint](#what-happens-when-you-call-the-endpoint)
-3. [Repository layout](#repository-layout)
-4. [Requirements](#requirements)
-5. [Quick start](#quick-start)
-6. [GPU or CPU](#gpu-or-cpu)
-7. [Team testing over ngrok](#team-testing-over-ngrok)
-8. [Configuration](#configuration)
-9. [API](#api)
-10. [Testing](#testing)
-11. [Performance](#performance)
-12. [Documentation](#documentation)
-13. [Project status](#project-status)
-14. [Contributing](#contributing)
+3. [Recommendation](#recommendation)
+4. [Repository layout](#repository-layout)
+5. [Requirements](#requirements)
+6. [Quick start](#quick-start)
+7. [GPU or CPU](#gpu-or-cpu)
+8. [Team testing over ngrok](#team-testing-over-ngrok)
+9. [Configuration](#configuration)
+10. [API](#api)
+11. [Testing](#testing)
+12. [Performance](#performance)
+13. [Documentation](#documentation)
+14. [Project status](#project-status)
+15. [Contributing](#contributing)
 
 ## How it works
 
@@ -70,10 +75,41 @@ sequenceDiagram
 
 **When something goes wrong.** A temporary problem retries the job after 5, 15, 60 and 300 s, then fails it with an `error_code`. A permanent problem answers `200` with `status: failed` (and sends a `moderation.failed` callback if one was asked for). A worker crash requeues the job after the lease ends. If the database is down, the API answers `503` within 5 s.
 
+## Recommendation
+
+The backend asks for a ranked feed for one user. It builds up to 200 candidate posts and sends them with the user's features. The service scores, orders and returns every candidate with its reasons. It keeps no state and uses no database, so the same request always gives the same order.
+
+```mermaid
+sequenceDiagram
+    participant B as Backend
+    participant A as API (app.py)
+    participant S as Scoring
+    participant V as Diversity
+    B->>B: build up to 200 candidates (only posts moderation labelled allow)
+    B->>A: POST /v1/recommendations (candidates, user_features)
+    A->>S: score each candidate
+    Note over S: topic .30, relationship .25, freshness .20, engagement .15, exploration .10, minus penalty
+    S->>V: candidates sorted by score
+    Note over V: max 2 in a row from the same creator or topic. A post is delayed, never dropped
+    V-->>A: ranked order
+    A-->>B: 200 {ranked_posts with score and reasons}
+    B->>B: render the feed in that order
+```
+
+- The score is a weighted sum of five parts: topic match (0.30), relationship, meaning a followed creator or recent engagement with the creator (0.25), freshness (0.20), engagement (0.15) and exploration (0.10), minus the post's `penalty`. Freshness decays with the post's age (half-life 24 h, 72 h for followed creators). Engagement is smoothed so a post with few impressions does not win on a lucky like. Exploration goes to candidates whose `source` is `exploration`.
+- The diversity step then keeps at most 2 posts in a row from the same creator and at most 2 in a row on the same topic. A post that would break the rule is moved down, not removed, so every candidate is returned.
+- Each ranked post has up to three short `reasons`, so the backend can explain the order.
+
+**The two features never call each other.** Moderation does not know about the feed, and recommendation does not know about moderation. The backend carries the moderation label into the candidate filter: it sends only posts moderation labelled `allow`. Recommendation does not check this.
+
+**Stateless, no database.** Nothing is saved between requests, and a down Postgres does not stop ranking (the root app runs with `tolerate_db_down`). `penalty` is the future hook: a later safety or quality signal can be sent per candidate and is subtracted from the score. Its size is not decided yet (`REC_DEFAULT_PENALTY` is 0).
+
 ## Repository layout
 
 ```
-moderation/            the service: the only code that ships in the Docker images
+app.py                 the single entry point: moderation and recommendation behind one API (uvicorn app:create_app --factory)
+recommendation/        the feed ranking (api/, config.py, scoring.py, diversity.py, ranking.py); stateless, no database
+moderation/            the moderation service
   api/                   the Check door (app.py, routes.py, schemas.py)
   worker.py              loads the models, runs jobs, retries, sends callbacks
   moderate.py            checks one post; the worst result wins
@@ -89,9 +125,11 @@ moderation/            the service: the only code that ships in the Docker image
   config.py              every setting, and the pinned model versions
   classifiers/           text (Qwen3Guard), image (SigLIP2), OCR (RapidOCR)
 migrations/            database schema (001_init.sql, 002_video.sql)
-tests/                 unit/ (no GPU, no database), integration/ (Postgres), models/ (real weights);
+tests/                 unit/ (no GPU, no database; unit/recommendation for the ranking), integration/ (Postgres), models/ (real weights);
+  data/recommendation/   sample candidate requests for the ranking tests and the test page
                        eval_text.py: runs the labelled captions in tests/data through the real text pipeline
 testui/                local test page for the Check door
+  recommendation/        test page for the feed ranking (Streamlit)
 Dockerfile, docker-compose.gpu.yml, docker-compose.cpu.yml, pyproject.toml, .env.example
 models/                model files: created by the download step, not in Git
 model_download.py      download the models and build the image head (run it once on a new machine)
@@ -155,7 +193,7 @@ Invoke-RestMethod http://localhost:8000/readyz
 docker compose -f docker-compose.gpu.yml logs worker      # or docker-compose.cpu.yml
 ```
 
-Done when `readyz` answers `status: ready` and the worker log has a line with `"msg": "models ready"`. The API reference is at <http://localhost:8000/docs>.
+Done when `readyz` answers `status: ready` and the worker log has a line with `"msg": "models ready"`. The API reference is at <http://localhost:8000/docs>. The containers run `uvicorn app:create_app --factory`, so the same door serves moderation and `POST /v1/recommendations`. To run the API on your machine without Docker (needs `DATABASE_URL`, and moderation jobs still need the worker): `uvicorn app:create_app --factory`. For moderation only: `uvicorn moderation.api:create_app --factory`.
 
 **Step 6. Send a first post.**
 
@@ -166,9 +204,18 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8000/v1/moderations -Conten
 
 Done when the answer has `"status": "done"` and `"label": "allow"`. The request waits for the decision (usually under a second), so the answer comes straight back. The full request and response are in [API](#api).
 
+**Step 7 (optional). Try the feed ranking.** It needs no database and no models.
+
+```powershell
+$body = Get-Content tests\data\recommendation\recommendation_candidates_test.json -Raw
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/v1/recommendations -ContentType "application/json" -Body $body
+```
+
+Done when the answer has `ranked_posts` with every candidate. Add `-Headers @{ "X-API-Key" = "<key>" }` if `API_KEYS` is set.
+
 **Stop the system** with `docker compose -f docker-compose.gpu.yml down` (or the `cpu` file). Add `-v` only if you also want to delete the database.
 
-**Try it by hand with a page.** `python testui\server.py`, then open <http://localhost:8090>. Write a caption, add images from the examples, an upload or **any image URL (for example Cloudinary)**, and send. The page sends the post exactly as the backend would, then shows the request, the response, the live status and the callback, and explains any problem in plain words. For real URLs the host must be in `IMAGE_ALLOWED_HOSTS`. Setup and tips are in [testui/README.md](testui/README.md).
+**Try it by hand with a page.** `python testui\server.py`, then open <http://localhost:8090>. Write a caption, add images from the examples, an upload or **any image URL (for example Cloudinary)**, and send. The page sends the post exactly as the backend would, then shows the request, the response, the live status and the callback, and explains any problem in plain words. For real URLs the host must be in `IMAGE_ALLOWED_HOSTS`. Setup and tips are in [testui/README.md](testui/README.md). For the feed ranking there is a separate page: `streamlit run testui/recommendation/app.py` (install the `ui` extra first: `pip install -e .[ui]`).
 
 ## GPU or CPU
 
@@ -282,13 +329,35 @@ All settings are environment variables, read from `.env`. [.env.example](.env.ex
 
 Model versions are pinned in `moderation/config.py` (`MODEL_PINS`).
 
+**Recommendation settings.** Every field of `RecommendationSettings` (`recommendation/config.py`) is read from an environment variable with the `REC_` prefix. The defaults are the values in the implementation plan, so none of them needs to be set. The same keys are in [.env.example](.env.example). `API_KEYS` and `X-API-Key` are shared with moderation.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `REC_TOPIC_WEIGHT` | 0.30 | Weight of topic relevance. |
+| `REC_RELATIONSHIP_WEIGHT` | 0.25 | Weight of a followed creator, or recent engagement with the creator. |
+| `REC_FRESHNESS_WEIGHT` | 0.20 | Weight of freshness. |
+| `REC_ENGAGEMENT_WEIGHT` | 0.15 | Weight of smoothed engagement. |
+| `REC_EXPLORATION_WEIGHT` | 0.10 | Weight of exploration. The five weights should sum to 1.0. |
+| `REC_DEFAULT_FRESHNESS_HALF_LIFE_HOURS` | 24 | Hours for freshness to halve. |
+| `REC_FOLLOWED_FRESHNESS_HALF_LIFE_HOURS` | 72 | The same, for posts of followed creators. |
+| `REC_ENGAGEMENT_SMOOTHING_K` | 20 | Smoothing: (likes + save weight x saves + k x prior) / (impressions + k). |
+| `REC_ENGAGEMENT_PRIOR` | 0.05 | The prior engagement rate used in the smoothing. |
+| `REC_SAVE_WEIGHT` | 2 | How many likes a save counts as. |
+| `REC_MAX_CONSECUTIVE_SAME_CREATOR` | 2 | Most posts in a row from one creator. |
+| `REC_MAX_CONSECUTIVE_SAME_TOPIC` | 2 | Most posts in a row on one topic. |
+| `REC_EXPLORATION_SOURCE` | `exploration` | The candidate `source` name that earns the exploration score. |
+| `REC_MODEL_NAME` | `rules_v1` | Name returned in the response `model` field. |
+| `REC_MAX_CANDIDATES` | 200 | Most candidates per request (`422 limit_exceeded` above it). |
+| `REC_MAX_BODY_BYTES` | 1048576 (1 MiB) | Largest `/v1/recommendations` body; bigger is `413`. 200 candidates are about 110 KB. |
+| `REC_DEFAULT_PENALTY` | 0.0 | Penalty setting; a caller may also send `penalty` per candidate. |
+
 ## API
 
 Interactive documentation, with every field and response code: `{BASE_URL}/docs` and `{BASE_URL}/redoc` (the raw OpenAPI file is `{BASE_URL}/openapi.json`). This section is the guide for calling the checker from the backend.
 
 **URL structure**
 
-Every URL is `{BASE_URL}` plus a path. `{BASE_URL}` is the address where the checker's `api` service is reachable:
+Every URL is `{BASE_URL}` plus a path. `{BASE_URL}` is the address where the `api` service is reachable (moderation and recommendation share it):
 
 | Where | `{BASE_URL}` |
 |---|---|
@@ -301,6 +370,7 @@ Every URL is `{BASE_URL}` plus a path. `{BASE_URL}` is the address where the che
 | `GET {BASE_URL}/v1/moderations/{job_id}` | State of one job. `{job_id}` is the UUID from a `202` (or a `200`). | `200` same body as the `POST` decision |
 | `POST {BASE_URL}/v1/moderations/uploads` | Upload one raw image instead of hosting it. Needs `IMAGE_ALLOWED_ROOT` (see [Raw image uploads](#raw-image-uploads)). | `201 {media_id, url}` |
 | `POST {BASE_URL}/v1/moderations/uploads/video` | Upload one raw video (MP4, MOV, WebM or MKV) instead of hosting it. Needs `IMAGE_ALLOWED_ROOT`. | `201 {media_id, url}` |
+| `POST {BASE_URL}/v1/recommendations` | Rank the candidate posts for one user (see [Recommendation API](#recommendation-api)). | `200` ranked posts |
 | `GET {BASE_URL}/healthz` | The process is up. | `200 {"status": "ok"}` |
 | `GET {BASE_URL}/readyz` | The database answers. | `200 {"status": "ready"}`, or `503` |
 
@@ -437,6 +507,72 @@ If a post cannot be checked at all, the callback is `moderation.failed`:
 
 `error_code` is one of `media_not_found`, `media_too_large`, `media_unsupported`, `media_forbidden`, `media_undecodable`, `model_oom`, `attempts_exhausted` or `internal_error`.
 
+### Recommendation API
+
+**`POST {BASE_URL}/v1/recommendations`** ranks the candidate posts for one user and answers `200` at once. It needs the same `X-API-Key` as moderation when `API_KEYS` is set. The backend must send **only posts moderation has allowed**. Send up to 200 candidates (`REC_MAX_CANDIDATES`); each `post_id` must be unique in the request.
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `request_id` | string | no | Echoed in the response and the log. |
+| `user_id` | string | yes | The user the feed is for. |
+| `candidates` | list of 1 to 200 objects | yes | The posts to rank. |
+| `candidates[].post_id` | string | yes | Your post id. Unique within the request. |
+| `candidates[].creator_id` | string | yes | The post's creator. |
+| `candidates[].topics` | list of strings | no | Topics of the post. |
+| `candidates[].age_hours` | number, 0 or more | yes | Hours since it was published. |
+| `candidates[].likes`, `saves`, `impressions` | integers, 0 or more | no | Engagement counts (default 0). |
+| `candidates[].is_followed` | boolean | no | The user follows the creator (default false). |
+| `candidates[].source` | string | yes | Which candidate source found it. `exploration` earns the exploration score. |
+| `candidates[].penalty` | number, 0 or more (0 to 1 in practice) | no | Subtracted from the score (default 0). |
+| `user_features.topic_weights` | object, topic to 0..1 | no | How much the user likes each topic. |
+| `user_features.recent_creator_engagement` | object, creator id to 0..1 | no | Recent engagement with each creator. |
+| `user_features.impressions_count`, `positive_actions_count` | integers | no | User totals (default 0). |
+| `context` | object | no | Accepted, not used for ranking yet. |
+
+Example body:
+
+```json
+{
+  "request_id": "feed-001",
+  "user_id": "u_456",
+  "candidates": [
+    { "post_id": "p1", "creator_id": "c1", "topics": ["cooking"], "age_hours": 3, "likes": 40, "saves": 5, "impressions": 900, "is_followed": true, "source": "following" },
+    { "post_id": "p2", "creator_id": "c2", "topics": ["travel"], "age_hours": 30, "likes": 2, "saves": 0, "impressions": 50, "is_followed": false, "source": "exploration" }
+  ],
+  "user_features": {
+    "topic_weights": { "cooking": 0.9, "travel": 0.2 },
+    "recent_creator_engagement": { "c1": 0.7 }
+  }
+}
+```
+
+Answer `200`. Every candidate is returned, best first, with a score and up to three reasons:
+
+```json
+{
+  "request_id": "feed-001",
+  "model": "rules_v1",
+  "user_id": "u_456",
+  "ranked_posts": [
+    { "post_id": "p1", "score": 0.78, "reasons": ["matches a topic you like", "from a creator you follow", "recent"] },
+    { "post_id": "p2", "score": 0.29, "reasons": ["something new to explore"] }
+  ],
+  "total_candidates": 2
+}
+```
+
+The scores and reason texts above only show the shape of the answer.
+
+| HTTP | `error` | When | What to do |
+|---|---|---|---|
+| 401 | `unauthorized` | `API_KEYS` is set and `X-API-Key` is missing or wrong. | Send a valid key. |
+| 413 | `body_too_large` | Body larger than `REC_MAX_BODY_BYTES` (1 MiB). | Send fewer candidates. |
+| 422 | `limit_exceeded` | More than `REC_MAX_CANDIDATES` candidates. | Send at most 200. |
+| 422 | `duplicate_post_ids` | A `post_id` appears twice. | Make the ids unique. |
+| 422 | (none: a `detail` list) | Malformed body: wrong type, missing field, no candidates. | Fix the body. |
+
+**Integration steps for the backend:** (1) take posts moderation labelled `allow`, (2) pick up to 200 candidates and add the user's features, (3) `POST /v1/recommendations`, (4) show the posts in the order of `ranked_posts`. A timeout or network error is safe to retry: the request changes nothing.
+
 ### Raw image uploads
 
 An alternative to hosting the image yourself. It is off unless `IMAGE_ALLOWED_ROOT` is set (in Docker: `IMAGE_ALLOWED_ROOT=/app/uploads` in `.env`).
@@ -488,9 +624,10 @@ Errors the API makes itself have the shape `{"error": "...", "detail": "..."}`. 
 ## Testing
 
 ```powershell
-ruff check moderation tests testui model_download.py
+ruff check moderation recommendation app.py tests testui model_download.py
 mypy
-pytest tests/unit -q                       # no database or models needed
+pytest tests/unit -q                       # no database or models needed (moderation and recommendation)
+pytest tests/unit/recommendation -q        # the feed ranking only
 pytest tests/models -q                     # real models; needs the downloaded weights
 ```
 
@@ -508,13 +645,23 @@ $env:TEST_DATABASE_URL = "postgresql://moderation:moderation@localhost:5432/mode
 pytest tests/integration -q
 ```
 
+The recommendation tests (`tests/unit/recommendation`) need nothing: no database, no models, no GPU. Sample requests are in `tests/data/recommendation`.
+
+**Try the ranking by hand.** Install the extra once (`pip install -e .[ui]`), then:
+
+```powershell
+streamlit run testui/recommendation/app.py
+```
+
+The page loads a sample request, lets you change the weights, and shows the order and the reasons.
+
 | Suite | Count | Needs |
 |---|---|---|
 | Unit | 329 | nothing |
 | Integration | 32 | Postgres (uses a separate `moderation_test` database) |
 | Model | 24 | the downloaded models |
 
-Last full run, with D2: 385 tests passed (329 unit, 32 integration, 24 model), on 12 November 2026. After the parallel video change (13 November 2026) the unit suite has 345 tests and passes; the integration tests were not re-run, because the store is unchanged. The D2 tests use synthetic clips made at test time; the model tests need the downloaded weights. The manual and end-to-end cases, with real GPU and CPU results, are in the Test Cases document (see [Documentation](#documentation)).
+Last full run, with D2: 385 tests passed (329 unit, 32 integration, 24 model), on 12 November 2026. After the parallel video change (13 November 2026) the unit suite has 345 tests and passes; the integration tests were not re-run, because the store is unchanged. The counts above were taken before the recommendation tests were added; run `pytest tests/unit` for the current number. The D2 tests use synthetic clips made at test time; the model tests need the downloaded weights. The manual and end-to-end cases, with real GPU and CPU results, are in the Test Cases document (see [Documentation](#documentation)).
 
 ## Performance
 
@@ -539,6 +686,7 @@ The handover documents are kept outside this repository and are shared separatel
 | Plan and handover | The design, what is built, open issues, next steps (section 16) |
 | Request flow diagram, module map | One-page pictures of a post's path and of the code modules |
 | Test cases | Every test case with its GPU and CPU result |
+| Recommendation Engine Implementation Plan, Recommendation Engine Workflow Report | The ranking design, and how a feed request flows through it (`docs/recommendation/`) |
 | D2 compliance and test report | D2 checked against the plan, section by section, and the D2 test results (`docs/D2_Compliance_and_Test_Report.md`) |
 
 The live API reference is always at <http://localhost:8000/docs>. `testui/make_test_doc.py` regenerates the Test Cases document from `testui/cases.json` and `testui/results.json`.
@@ -551,7 +699,14 @@ The live API reference is always at <http://localhost:8000/docs>. `testui/make_t
 | D2 | Video: posts with video, stories, reels, animated images | Implemented and tested locally. Not yet deployed to the shared stack |
 | D3 | Halal categories, other content types, calibrated thresholds, human review | Not started |
 | D4 | Chat review | Not started |
-| D5 | Recommendations | Not started |
+| D5 | Recommendations | Implemented and tested locally: rules-based ranking (`rules_v1`), stateless, no database. Not yet deployed to the shared stack. No learned model yet |
+
+**Known limits of D5** (recommendation):
+
+- The ranking is rules only. Weights and half-lives are the plan's starting values and are not tuned on real feed data.
+- The service trusts the backend to send only `allow` posts. It does not check.
+- `penalty` has no source yet; nothing sets it unless the backend sends it.
+- `context` is accepted and ignored. Nothing is learned or stored between requests.
 
 **Known limits of D1** (full list in section 16.4 of the handover):
 

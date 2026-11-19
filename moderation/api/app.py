@@ -1,5 +1,6 @@
 """Builds the FastAPI app: settings, policy, store, error handlers and the two routers."""
 
+import logging
 from contextlib import asynccontextmanager
 
 import psycopg
@@ -33,8 +34,12 @@ TAGS = [
 ]
 
 
-def create_app(*, settings=None, store=None):
+def create_app(*, settings=None, store=None, extra_body_caps=None, tolerate_db_down=False):
+    """extra_body_caps: {path: bytes} for routes another feature mounts on this app (the root app.py).
+    tolerate_db_down: start even if Postgres does not answer, so stateless routes keep working; the moderation
+    routes then answer 503 until it is back."""
     cfg = settings or get_settings()
+    body_caps = dict(extra_body_caps or {})
 
     @asynccontextmanager
     async def lifespan(app):
@@ -42,7 +47,14 @@ def create_app(*, settings=None, store=None):
             yield
             return
         app.state.store = Store(cfg)
-        await app.state.store.open()
+        try:
+            await app.state.store.open()
+        except psycopg.Error as exc:
+            if not tolerate_db_down:
+                raise
+            logging.getLogger("moderation").warning(
+                "database not reachable at startup; moderation answers 503: %s: %s", type(exc).__name__, exc
+            )
         yield
         await app.state.store.close()
 
@@ -70,7 +82,7 @@ def create_app(*, settings=None, store=None):
         elif path == "/v1/moderations/uploads/video":
             cap = cfg.video_max_bytes + 4096
         else:
-            cap = cfg.api_max_body_bytes
+            cap = body_caps.get(path, cfg.api_max_body_bytes)
         declared = request.headers.get("content-length", "")
         if declared.isdigit() and int(declared) > cap:
             return JSONResponse(

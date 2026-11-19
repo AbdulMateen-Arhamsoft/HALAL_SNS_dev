@@ -96,7 +96,7 @@ services:
       - ./uploads:/app/uploads
     command:
       - uvicorn
-      - moderation.api:create_app
+      - app:create_app
       - --factory
       - --host
       - 0.0.0.0

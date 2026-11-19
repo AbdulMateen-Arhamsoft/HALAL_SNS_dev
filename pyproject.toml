@@ -35,9 +35,18 @@ models = [
   "av>=19.0",
 ]
 
+# Test pages (testui/): Streamlit explainer for the recommendation ranking.
+ui = [
+  "streamlit>=1.36,<2.0",
+  "pandas>=2.2,<3.0",
+]
+
+[tool.setuptools]
+py-modules = ["app"]
+
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["moderation*"]
+include = ["moderation*", "recommendation*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -51,7 +60,7 @@ extend-exclude = ["local/backup"]
 
 [tool.mypy]
 check_untyped_defs = true
-files = ["moderation"]
+files = ["moderation", "recommendation", "app.py"]
 cache_dir = "local/.mypy_cache"
 plugins = ["pydantic.mypy"]
 
