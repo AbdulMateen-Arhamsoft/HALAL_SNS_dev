@@ -176,13 +176,16 @@ def explain_post(
     exploration_score = scoring.calculate_exploration_score(source, cfg)
     penalty = scoring.clamp(float(post.get("penalty", cfg.default_penalty)))
 
-    weighted = {
-        "topic": cfg.topic_weight * topic_score,
-        "relationship": cfg.relationship_weight * relationship_score,
-        "freshness": cfg.freshness_weight * freshness_score,
-        "engagement": cfg.engagement_weight * engagement_score,
-        "exploration": cfg.exploration_weight * exploration_score,
-    }
+    weighted = scoring.weighted_parts(
+        {
+            "topic": topic_score,
+            "relationship": relationship_score,
+            "freshness": freshness_score,
+            "engagement": engagement_score,
+            "exploration": exploration_score,
+        },
+        cfg,
+    )
     final_before_floor = sum(weighted.values()) - penalty
     final_score = max(0.0, final_before_floor)
 

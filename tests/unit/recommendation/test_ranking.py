@@ -1,4 +1,3 @@
-import pytest
 
 from recommendation.config import RecommendationSettings
 from recommendation.ranking import generate_reasons, rank_posts
@@ -38,17 +37,6 @@ def test_every_candidate_returned_once() -> None:
 
 def test_empty_candidates() -> None:
     assert rank_posts([], {}, CFG) == []
-
-
-def test_too_many_candidates_raises() -> None:
-    cfg = CFG.with_overrides(max_candidates=2)
-    with pytest.raises(ValueError, match="Maximum 2"):
-        rank_posts([cand("1"), cand("2"), cand("3")], {}, cfg)
-
-
-def test_exactly_max_candidates_is_fine() -> None:
-    cfg = CFG.with_overrides(max_candidates=2)
-    assert len(rank_posts([cand("1", "a"), cand("2", "b")], {}, cfg)) == 2
 
 
 def test_reasons_followed_topic_recent() -> None:

@@ -66,8 +66,9 @@ def test_freshness_followed_half_life_is_72h() -> None:
     assert calculate_freshness_score(24, True, CFG) > calculate_freshness_score(24, False, CFG)
 
 
-def test_freshness_negative_age_is_treated_as_zero() -> None:
-    assert calculate_freshness_score(-10, False, CFG) == 1.0
+def test_freshness_negative_age_is_an_error() -> None:
+    with pytest.raises(ValueError, match="age_hours"):
+        calculate_freshness_score(-10, False, CFG)
 
 
 def test_engagement_no_data_is_the_prior() -> None:
@@ -84,9 +85,14 @@ def test_engagement_saves_count_double() -> None:
     assert calculate_engagement_score(0, 10, 100, CFG) > calculate_engagement_score(10, 0, 100, CFG)
 
 
-def test_engagement_clamped_to_one_and_negatives_floored() -> None:
+def test_engagement_clamped_to_one() -> None:
     assert calculate_engagement_score(1000, 0, 1, CFG) == 1.0
-    assert calculate_engagement_score(-5, -5, -5, CFG) == pytest.approx(0.05)
+
+
+@pytest.mark.parametrize("counts", [(-1, 0, 0), (0, -1, 0), (0, 0, -1)])
+def test_engagement_negative_count_is_an_error(counts) -> None:
+    with pytest.raises(ValueError, match="negative"):
+        calculate_engagement_score(*counts, CFG)
 
 
 def test_engagement_zero_denominator_is_zero() -> None:

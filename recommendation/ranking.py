@@ -32,11 +32,9 @@ def rank_posts(
     user_features: dict[str, Any],
     cfg: RecommendationSettings | None = None,
 ) -> list[dict[str, Any]]:
-    """Score every candidate, sort by score, apply diversity and add reasons."""
+    """Score every candidate, sort by score, apply diversity and add reasons.
+    The candidate limit is checked by the route (recommendation/api/routes.py), not here."""
     cfg = cfg or get_settings()
-    if len(candidates) > cfg.max_candidates:
-        raise ValueError(f"Maximum {cfg.max_candidates} candidates are allowed.")
-
     scored = [calculate_post_score(candidate, user_features, cfg) for candidate in candidates]
     scored.sort(key=lambda post: post["score"], reverse=True)
     diversified = apply_diversity(scored, cfg)

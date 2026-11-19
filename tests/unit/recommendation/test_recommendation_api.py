@@ -12,8 +12,10 @@ DATA = Path(__file__).resolve().parents[2] / "data" / "recommendation"
 URL = "/v1/recommendations"
 
 
-def client_for(*, api_keys: str = "", max_body_bytes: int = 1024 * 1024) -> httpx.AsyncClient:
-    rec = RecommendationSettings(_env_file=None).with_overrides(max_body_bytes=max_body_bytes)
+def client_for(*, api_keys: str = "", max_body_bytes: int = 1024 * 1024, max_candidates: int = 200) -> httpx.AsyncClient:
+    rec = RecommendationSettings(_env_file=None).with_overrides(
+        max_body_bytes=max_body_bytes, max_candidates=max_candidates
+    )
     app = create_app(settings=make_settings(api_keys=api_keys), store=FakeStore(), recommendation_settings=rec)  # type: ignore[arg-type]
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
@@ -105,6 +107,15 @@ async def test_201_candidates_is_422() -> None:
         resp = await client.post(URL, json=body(201))
     assert resp.status_code == 422
     assert resp.json()["error"] == "limit_exceeded"
+
+
+async def test_configured_candidate_limit_is_enforced_by_the_route() -> None:
+    async with client_for(max_candidates=3) as client:
+        too_many = await client.post(URL, json=body(4))
+        allowed = await client.post(URL, json=body(3))
+    assert too_many.status_code == 422
+    assert too_many.json()["error"] == "limit_exceeded"
+    assert allowed.status_code == 200
 
 
 async def test_200_candidates_is_accepted() -> None:
