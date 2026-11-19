@@ -151,11 +151,51 @@ def show_process_overview(scenario: dict, result: dict) -> None:
         source = candidate.get("source", "unknown")
         sources[source] = sources.get(source, 0) + 1
 
-    c1, c2, c3, c4 = st.columns(4)
+    interests = sorted(
+        scenario.get("user_features", {}).get("topic_weights", {}).items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    interests_text = " · ".join(f"{topic} {weight:.2f}" for topic, weight in interests)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Candidates", len(candidates))
     c2.metric("User", scenario.get("user_id", "—"))
-    c3.metric("Top score", f"{result['ranked'][0]['score']:.4f}" if result["ranked"] else "—")
-    c4.metric("Diversity moves", len(result["diversity_moves"]))
+    c3.metric(
+        "User interests",
+        f"{len(interests)} topics" if interests else "None",
+        help=interests_text or "This user has no topic interests yet (new user).",
+    )
+    c4.metric("Top score", f"{result['ranked'][0]['score']:.4f}" if result["ranked"] else "—")
+    c5.metric("Diversity moves", len(result["diversity_moves"]))
+    st.caption(
+        f"**User interests (topic weight):** {interests_text}"
+        if interests
+        else "**User interests:** none. New user with no topic weights, so ranking uses freshness, engagement and exploration."
+    )
+    if interests:
+        posts_per_topic: dict[str, int] = {}
+        for candidate in candidates:
+            for topic in candidate.get("topics", []):
+                posts_per_topic[topic] = posts_per_topic.get(topic, 0) + 1
+        with st.expander(f"User's topics ({len(interests)})", expanded=True):
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Topic": topic,
+                            "Weight": float(weight),
+                            "Candidate posts with this topic": posts_per_topic.get(topic, 0),
+                        }
+                        for topic, weight in interests
+                    ]
+                ),
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Weight": st.column_config.ProgressColumn("Weight", min_value=0.0, max_value=1.0, format="%.2f"),
+                },
+            )
 
     steps = [
         ("Load", f"{len(candidates)} posts from selected scenario"),
